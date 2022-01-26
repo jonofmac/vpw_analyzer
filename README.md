@@ -20,6 +20,11 @@ Once the serial device is entered, press the "Read" button to connect and begin 
 
 There are 2 boxes in main window. The bottom box shows the messages that were received in order. The top box shows unique messages. For example, if duplicate messages are received, then you would see it twice in the bottom box, but only once in the top box. By changing the "Compare First # Bytes" dropdown changes how many bytes of a data payload are compared to determine if a message is unique or not. Most data responses contain 2 bytes that are an acknowledgement and an ID confirmation.
 
+To export a log to a text file, click the "Export Logs" button.
+To import a log (or any text file with 1 message per line), enter the path (relative to vpw_analyzer.py or absolute both work) to the text file into the OBD Device Serial Port box and press "Read" button.
+
+Clear Message Logs button will clear out the messages.
+
 # Known Issues
 - Sending messages does not work
 - Exiting software crashes it
