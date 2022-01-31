@@ -39,29 +39,35 @@ class OBD():
         
     def open(self):
     
-        print ("Opening ",self.filename, "  and serial: ",self.serial)
+        print ("Opening ",self.filename, ". Is serial port: ",self.serial)
         if (self.serial):
-            self.sp = serial.Serial(timeout=5)
+            self.sp = serial.Serial(timeout=10)
             self.sp.port = self.filename
             self.sp.open()
             
             while (self.sp.is_open == False):
-                print ("Waiting")
+                print ("Trying to open port")
                 
             
             # Configure the modem
-            self.sp.write(b'z\r\n') # Just send random keystroke in case we get stuck in a weird mode
-            self.sp.write(b'atz\r\n')
-            self.sp.write(b'atsp2\r\n')
-            #self.sp.write(b'ate0\r\n')
-            self.sp.write(b'ath1\r\n')
-            self.sp.write(b'atma\r\n')
+            self.sp.write(b'z\r\n')     # Just send random keystroke in case we get stuck in a weird mode
+            time.sleep(1)               # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            self.sp.write(b'atz\r\n')   # Reset the device
+            time.sleep(1)               # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            self.sp.write(b'atl1\r\n')  # Enable new line characters between commands/messages
+            time.sleep(0.5)             # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            self.sp.write(b'atsp2\r\n') # Set protocol to VPW J1850
+            time.sleep(0.5)             # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            self.sp.write(b'ath1\r\n')  # Enable headers
+            time.sleep(0.5)             # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            self.sp.write(b'atma\r\n')  # Begin monitoring bus traffic
         else:
             self.fd = open(self.filename, 'r')
     
     def close(self):
         if self.serial:
             self.sp.write(b'a\r\n')
+            time.sleep(1)
             self.sp.close()
         else:
             self.fd.close()
