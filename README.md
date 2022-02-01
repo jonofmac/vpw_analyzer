@@ -27,5 +27,4 @@ Clear Message Logs button will clear out the messages.
 
 # Known Issues
 - Sending messages does not work
-- Exiting software crashes it
 
