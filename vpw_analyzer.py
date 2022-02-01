@@ -2,13 +2,23 @@
 VPW Analyzer
 By Jonathan Valdez
 
-Version 0.1 - Jan 25, 2022
+Version 0.3 - Feb 1, 2022
 Description: This is a utility that parses incoming messages from a VPW interface
     into a more human-readable format. The bottom box shows each message that was
     received in order. The top box shows unique messages that were received.
     It connects to an ELM327 like device via a serial port. If on Windows, type
     the COM port number into the 'OBD Device Port' and press 'Read'. If on Unix
     based system, type in the full path (/dev/serialTTY) and press 'Read'.
+
+Changes
+    - TBD
+
+
+Version 0.2 - Jan 26, 2022
+Changes
+    - Fixed crashing on exit
+    - Added some device response verification steps
+    - Query device string to get model and firmware info
 '''
 from logging import exception
 import tkinter as tk
@@ -40,7 +50,7 @@ class OBD():
         self.dev_type = None
         self.dev_string = None
         
-        # Probably a better way to determine if something is a serial device or not.
+        # There is probably a better way to determine if something is a serial device or not.
         if ("/dev" in filename or "COM" in filename or "com" in filename):
             self.serial = True
         
