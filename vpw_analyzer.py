@@ -10,7 +10,9 @@ Description: This is a utility that parses incoming messages from a VPW interfac
     the COM port number into the 'OBD Device Port' and press 'Read'. If on Unix
     based system, type in the full path (/dev/serialTTY) and press 'Read'.
 '''
+from logging import exception
 import tkinter as tk
+from tkinter import messagebox
 import tkinter.ttk as ttk
 import binascii
 import queue
@@ -20,6 +22,7 @@ import pandas as pd
 import string
 import serial
 import sys
+import re
 
 '''
 OBD class is used to communicate
@@ -31,7 +34,14 @@ class OBD():
         self.sp = None
         self.lines = None
         self.serial = False
-        if ("/dev" in filename or "COM" in filename):
+        self.dev_ati_string = None
+        self.dev_sti_string = None
+        self.dev_dxi_string = None
+        self.dev_type = None
+        self.dev_string = None
+        
+        # Probably a better way to determine if something is a serial device or not.
+        if ("/dev" in filename or "COM" in filename or "com" in filename):
             self.serial = True
         
     def __del__ (self):
@@ -39,36 +49,83 @@ class OBD():
         
     def open(self):
     
-        print ("Opening ",self.filename, ". Is serial port: ",self.serial)
         if (self.serial):
-            self.sp = serial.Serial(timeout=10)
+            print ("Opening serial port:",self.filename)
+        else:
+            print ("Opening file:", self.filename)
+
+        if (self.serial):
+            if self.sp:
+                self.sp.close()
+
+            self.sp = serial.Serial(timeout=3)
             self.sp.port = self.filename
             self.sp.open()
             
-            while (self.sp.is_open == False):
-                print ("Trying to open port")
+            if (self.sp.is_open == False):
+                raise Exception("Unable to open serial port")
                 
             
             # Configure the modem
-            self.sp.write(b'z\r\n')     # Just send random keystroke in case we get stuck in a weird mode
-            time.sleep(1)               # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            self.sp.write(b'\r')        # Wake the part
+            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
             self.sp.write(b'atz\r\n')   # Reset the device
-            time.sleep(1)               # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            reset_response = self.sp.read_until(b'>')
+            if (len(reset_response) == 0): raise Exception("Did not receieve any data from device. Wrong serial port?")
+            if (b'OK' not in reset_response):
+                # Seems we interrupted a command, let's try again
+                self.sp.write(b'atz\r\n')   # Reset the device
+                reset_response = self.sp.read_until(b'>')
+                if (len(reset_response) == 0): raise Exception("Did not receieve any data from device. Wrong serial port?")
+                if (b'OK' not in reset_response and reset_response[-1] != b'>'): raise Exception("Device did not acknowledge reset request")
+
+            self.sp.write(b'atz\r\n')   # Reset the device
+            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
             self.sp.write(b'atl1\r\n')  # Enable new line characters between commands/messages
-            time.sleep(0.5)             # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
+            
+            self.sp.write(b'ati\r\n')   # Check ELM protocol version
+            self.dev_ati_string = (self.sp.read_until(b'>').decode("utf-8"))
+            self.dev_ati_string = re.search('\n(.*)\r',self.dev_ati_string).group(1)
+
+
+            self.sp.write(b'sti\r\n')   # Check if STN device
+            self.dev_sti_string = self.sp.read_until(b'>').decode("utf-8")
+            self.dev_sti_string = re.search('\n(.*)\r',self.dev_sti_string).group(1)
+
+            self.sp.write(b'dxi\r\n')   # Check if OBDX device
+            self.dev_dxi_string = self.sp.read_until(b'>').decode("utf-8")
+            self.dev_dxi_string = re.search('\n(.*?)( SN.*)?\r',self.dev_dxi_string).group(1)
+
+            if ("?" not in self.dev_sti_string):
+                self.dev_type = "STN"
+                self.dev_string = self.dev_sti_string
+            elif ("?" not in self.dev_dxi_string):
+                self.dev_type = "OBDX"
+                self.dev_string = self.dev_dxi_string
+            else:
+                self.dev_type = "ELM"
+                self.dev_string = self.dev_ati_string
+
+            print("Detected device was a",self.dev_type,"with a version string of:",self.dev_string)
+            
+
             self.sp.write(b'atsp2\r\n') # Set protocol to VPW J1850
-            time.sleep(0.5)             # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
             self.sp.write(b'ath1\r\n')  # Enable headers
-            time.sleep(0.5)             # Sleep seems to help with some bluetooth devices. This is a band aid until I can do proper verification...
+            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
             self.sp.write(b'atma\r\n')  # Begin monitoring bus traffic
+            if (len(self.sp.read_until(b'\r\n')) == 0): raise Exception("Device did not enter atma mode")
+            print("Connected")
         else:
             self.fd = open(self.filename, 'r')
     
     def close(self):
         if self.serial:
-            self.sp.write(b'a\r\n')
-            time.sleep(1)
-            self.sp.close()
+            if self.sp.is_open:
+                self.sp.write(b'a\r\n')
+                time.sleep(1)
+                self.sp.close()
         else:
             self.fd.close()
         
@@ -323,30 +380,42 @@ class MessageManager():
 This class is used to run the serial/OBD class in a separate thread
 '''
 class ThreadedTask(threading.Thread):
-    def __init__(self, queueV, gui, rawString):
+    def __init__(self, gui, file_path):
         threading.Thread.__init__(self)
-        self.queueV = queueV
         self.gui = gui
-        self.rawString = rawString
+        self.file_path = file_path
+        self.stop_var = False
+        self.obd = None
         
     def run(self):
+        if (self.obd):
+            self.obd.close()
+
+        self.obd = OBD(self.file_path)
+        self.obd.open()
+        self.gui.update_obd_status(True,self.obd.dev_string)
+        threadPointer = threading.current_thread()
+
         
-        file = OBD(self.rawString)
-        file.open()
-        
-        while True:
+        while (self.stop_var == False):
             try:
                 #time.sleep(0.1)  # Simulate long running process
-                line = file.read()
+                line = self.obd.read()
+                if self.stop_var:
+                    break
+
                 if not line:
                     continue
+                #TODO: Probably should use a queue instead of calling another thread's function...
                 self.gui.mm.new_message(line)
-            except KeyboardInterrupt:
-                print ("Received keyboard int")
+            except:
+                print ("Exception in file reading thread")
                 break
         
-        file.close()
-        self.queueV.put("Task finished")
+        self.obd.close()
+
+    def stop(self):
+        self.stop_var = True
     
 '''
 Main application class that handles the GUI
@@ -354,6 +423,7 @@ Main application class that handles the GUI
 class Application(tk.Frame):
     def __init__(self, root):
         self.root = root
+        self.thread_reading = None
         self.initialize_user_interface()
         self.update_status_bar(False)
         self.mm = MessageManager(self)
@@ -374,6 +444,7 @@ class Application(tk.Frame):
         
         ''' Variables for GUI '''
         self.statusBarString = tk.StringVar()
+        self.statusBarOBDString = tk.StringVar()
         self.messageTreeLock = tk.BooleanVar()
         self.hideHeartbeats = tk.BooleanVar()
         self.messageUniqueByte = tk.StringVar()
@@ -552,7 +623,7 @@ class Application(tk.Frame):
         self.send_selected_button = tk.Button(self.transmit_frame, text="Send Selected Message")
         self.send_selected_button.grid(row=6, column=0, sticky='s')
         
-        self.exit_button = tk.Button(self.transmit_frame, text="Exit Program", command=self.root.quit)
+        self.exit_button = tk.Button(self.transmit_frame, text="Exit Program", command=self.on_app_close)
         self.exit_button.grid(row=100, column=0, sticky='s')
         
     
@@ -560,22 +631,31 @@ class Application(tk.Frame):
         ''' Status Bar '''
         self.statusBar = tk.Label(self.root, textvariable=self.statusBarString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
         self.statusBar.grid(row=4, column=0, columnspan=5, sticky='nsew')
-        
+        self.statusBarOBD = tk.Label(self.root, textvariable=self.statusBarOBDString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
+        self.statusBarOBD.grid(row=4, column=2, columnspan=5, sticky='nsew')
         
         
         ''' Reset any variables '''
         self.sid = 0
         self.mid = 0
+        self.statusBarString.set("Messages: 0")
+        self.statusBarOBDString.set("OBD: Disconnected")
  
  
     def update_status_bar(self, messages=0, connected=False):
-        string = "Messages: " + str(messages) + "    OBDX: "
-        if (connected):
-            string = string + "Connected"
-        else:
-            string = string + "Disconnected"
+        string = "Messages: " + str(messages)
             
         self.statusBarString.set(string)
+
+    def update_message_count(self, messages=0):
+        self.messages_receieved = messages
+        
+
+    def update_obd_status(self,connected=False,dev_version=""):
+        if connected:
+            self.statusBarOBDString.set("OBD: Connected - " + str(dev_version))
+        else:
+            self.statusBarOBDString.set(str("OBD: Disconnected"))
     
     def insert_data(self):
         rawString = self.idnumber_entry.get()
@@ -619,7 +699,7 @@ class Application(tk.Frame):
         except:
             print ("Issue updating index, ", newMsg)
             for child in self.summaryTree.get_children():
-                print(summaryTree.item(child)["values"])
+                print(self.summaryTree.item(child)["values"])
     
     
     def delete_data(self):
@@ -637,14 +717,32 @@ class Application(tk.Frame):
         self.sid = 0
         
     def read_file(self):
-        rawString = self.serial_port_entry.get()
-        queueV = queue.Queue()
-        ThreadedTask(queueV, self, rawString).start()
+        file_path = self.serial_port_entry.get()
+        
+        if (self.thread_reading):
+            # A thread exists already. Must mean it's already open. We must close/destroy it
+            self.thread_reading.stop()
+            self.thread_reading.join(3)
+            if (self.thread_reading.is_alive()):
+                print("Error ending thread...")
+
+        self.thread_reading = ThreadedTask(self, file_path)
+        self.thread_reading.start()
+
+    def on_app_close(self):
+        if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
+            if (self.thread_reading):
+                self.thread_reading.stop()
+                self.thread_reading.join(3)
+                if (self.thread_reading.is_alive()):
+                    print("Error ending thread for app exit...")
+            self.root.destroy()
 
 
 
 
 if __name__ == "__main__" :
     app = Application(tk.Tk())
+    app.root.wm_protocol("WM_DELETE_WINDOW", app.on_app_close)
     app.root.mainloop()
 
