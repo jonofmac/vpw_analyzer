@@ -54,15 +54,17 @@ class OBD():
         if ("/dev" in filename or "COM" in filename or "com" in filename):
             self.serial = True
         
+
     def __del__ (self):
         self.close()
         
     def open(self):
     
         if (self.serial):
-            print ("Opening serial port:",self.filename)
+            print ("Opening serial port:", self.filename)
         else:
             print ("Opening file:", self.filename)
+
 
         if (self.serial):
             if self.sp:
@@ -78,16 +80,16 @@ class OBD():
             
             # Configure the modem
             self.sp.write(b'\r')        # Wake the part
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
+            if (len(self.sp.read_until(b'>')) == 0): raise Exception("No data received. Not connected/wrong serial port?")
             self.sp.write(b'atz\r\n')   # Reset the device
             reset_response = self.sp.read_until(b'>')
-            if (len(reset_response) == 0): raise Exception("Did not receieve any data from device. Wrong serial port?")
+            if (len(reset_response) == 0): raise Exception("No data received after reset attempt 1. Wrong serial port?")
             if (b'OK' not in reset_response):
                 # Seems we interrupted a command, let's try again
                 self.sp.write(b'atz\r\n')   # Reset the device
                 reset_response = self.sp.read_until(b'>')
-                if (len(reset_response) == 0): raise Exception("Did not receieve any data from device. Wrong serial port?")
-                if (b'OK' not in reset_response and reset_response[-1] != b'>'): raise Exception("Device did not acknowledge reset request")
+                if (len(reset_response) == 0): raise Exception("No data received after reset attempt 2. Wrong serial port?")
+                if (reset_response[-1] != ord('>')): raise Exception("Unexpected reset response: ", (reset_response.decode("utf-8")))
 
             self.sp.write(b'atz\r\n')   # Reset the device
             if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
@@ -390,12 +392,13 @@ class MessageManager():
 This class is used to run the serial/OBD class in a separate thread
 '''
 class ThreadedTask(threading.Thread):
-    def __init__(self, gui, file_path):
+    def __init__(self, gui, queue, file_path):
         threading.Thread.__init__(self)
         self.gui = gui
         self.file_path = file_path
         self.stop_var = False
         self.obd = None
+        self.queue = queue
         
     def run(self):
         if (self.obd):
@@ -417,7 +420,8 @@ class ThreadedTask(threading.Thread):
                 if not line:
                     continue
                 #TODO: Probably should use a queue instead of calling another thread's function...
-                self.gui.mm.new_message(line)
+                #self.gui.mm.new_message(line)
+                self.queue.put(line)
             except:
                 print ("Exception in file reading thread")
                 break
@@ -735,12 +739,14 @@ class Application(tk.Frame):
             self.thread_reading.join(3)
             if (self.thread_reading.is_alive()):
                 print("Error ending thread...")
-
-        self.thread_reading = ThreadedTask(self, file_path)
+        self.queue = queue.Queue()
+        self.thread_reading = ThreadedTask(self, self.queue, file_path)
         self.thread_reading.start()
 
+    def update_ui(self)
+
     def on_app_close(self):
-        if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
+        #if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
             if (self.thread_reading):
                 self.thread_reading.stop()
                 self.thread_reading.join(3)
