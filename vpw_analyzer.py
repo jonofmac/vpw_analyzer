@@ -28,11 +28,224 @@ import binascii
 import queue
 import threading
 import time
-import pandas as pd
+import pandas as pd  # Temporarily commented out for testing
 import string
 import serial
 import sys
 import re
+
+'''
+PRD (Parameter Response Data) class contains all data conversion methods
+for VPW message payloads according to SAE J2178 standards.
+'''
+class PRD:
+    """Parameter Response Data conversion methods for VPW messages"""
+    
+    # UNM (Unsigned Numeric) 8-bit methods
+    @staticmethod
+    def unm_08_15(payload):
+        """Convert 0-255 byte to 1/100 L per UNM-08-15"""
+        return (payload[0]) / 100 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_21(payload):
+        """Convert 0-255 byte to 1/6 per UNM-08-21"""
+        return (payload[0]) / 16 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_32(payload):
+        """Convert 0-255 byte to 1/16 per UNM-08-32"""
+        return (payload[0]) / 16 if len(payload) > 0 else 0
+    
+    @staticmethod
+    def unm_08_41(payload):
+        """Convert 0-255 byte to 1/10 per UNM-08-41"""
+        return (payload[0]) / 10 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_61(payload):
+        """Convert 0-255 byte to 0-100% per UNM-08-61"""
+        return (payload[0] * 100) / 255 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_71(payload):
+        """Convert 0-255 byte to 0-100% per UNM-08-71"""
+        return (payload[0] / 2) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_73(payload):
+        """Convert 0-255 byte to -40 to 87.5°C per UNM-08-73"""
+        return (payload[0] / 2) - 40 if len(payload) > 0 else 0
+    
+    @staticmethod
+    def unm_08_101(payload):
+        """Convert byte to 0 to 255 per UNM-08-101"""
+        return (payload[0]) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_102(payload):
+        """Convert byte to temperature in Celsius (-40 to 215°C) per UNM-08-102"""
+        return payload[0] - 40 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_125(payload):
+        """Convert byte to 0 to 637 per UNM-08-125"""
+        return (payload[0] * 5) / 2  if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_131(payload):
+        """Convert byte to 0 to 765 per UNM-08-131"""
+        return (payload[0] * 3) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_141(payload):
+        """Convert byte to 0 to 1048 per UNM-08-141"""
+        return (payload[0] * 4) if len(payload) > 0 else 0
+    
+    @staticmethod
+    def unm_08_151(payload):
+        """Convert byte to 0 to 2048 per UNM-08-151"""
+        return (payload[0] * 8) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_155(payload):
+        """Convert byte to 0 to 2550 g per UNM-08-155"""
+        return (payload[0] * 10) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_159(payload):
+        """Convert byte to 0 to 3570 per UNM-08-159"""
+        return (payload[0] * 14) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_161(payload):
+        """Convert byte to 0 to 4096 per UNM-08-161"""
+        return (payload[0] * 16) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_171(payload):
+        """Convert byte to 0 to 8160 per UNM-08-171"""
+        return (payload[0] * 32) if len(payload) > 0 else 0
+
+    # SED (State Encoded Data) 8-bit methods
+    @staticmethod
+    def sed_08_7(payload):
+        """Convert byte to state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 0):
+            return "Key Out"
+        elif (payload[0] == 1):
+            return "Key In Lock"
+        elif (payload[0] == 2):
+            return "Key In Unlock"
+        else:
+            return "Invalid"
+
+    @staticmethod
+    def sed_08_4(payload):
+        """Convert byte to Transmission state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 0):
+            return "Unknown"
+        elif (payload[0] == 1):
+            return "Reverse"
+        elif (payload[0] == 2):
+            return "Forward 1"
+        elif (payload[0] == 4):
+            return "Forward 2"
+        elif (payload[0] == 8):
+            return "Forward 3"
+        elif (payload[0] == 16):
+            return "Forward 4"
+        elif (payload[0] == 32):
+            return "Forward 5"
+        elif (payload[0] == 64):
+            return "Forward 6/Park"
+        elif (payload[0] == 128):
+            return "Neutral"
+        else:
+            return "Invalid"
+
+    @staticmethod
+    def sed_08_5(payload):
+        """Convert byte to Ignition Switch Position state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 1):
+            return "Accessory"
+        elif (payload[0] == 2):
+            return "Off / Lock"
+        elif (payload[0] == 4):
+            return "Off / Unlock"
+        elif (payload[0] == 8):
+            return "Run"
+        elif (payload[0] == 16):
+            return "Start"
+        else:
+            return "Invalid"
+
+    @staticmethod
+    def sed_08_6(payload):
+        """Convert byte to Transfer Case state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 1):
+            return "Neutral"
+        elif (payload[0] == 2):
+            return "2WD High"
+        elif (payload[0] == 3):
+            return "4WD Low"
+        elif (payload[0] == 4):
+            return "4WD High"
+        else:
+            return "Invalid"
+
+    # UNM (Unsigned Numeric) 16-bit methods
+
+    @staticmethod
+    def unm_16_5(payload):
+        """Convert byte to 0 to 512 per UNM-16-5"""
+        return (payload[0] << 8 | payload[1]) / 128 if len(payload) > 1 else None
+
+    @staticmethod
+    def unm_16_11(payload):
+        """Convert byte to 0 to 655.35 per UNM-16-11"""
+        return (payload[0] << 8 | payload[1]) / 100 if len(payload) > 1 else None
+
+    @staticmethod
+    def unm_16_31(payload):
+        """Convert byte to 0 to 61383 per UNM-16-31"""
+        return (payload[0] << 8 | payload[1]) / 4 if len(payload) > 1 else None
+
+    @staticmethod
+    def unm_24_11(payload):
+        """Convert byte to 0 to 1677721.6 per UNM-24-11"""
+        return ((payload[0] << 16 | payload[1] << 8 | payload[2]) / 10) if len(payload) > 2 else None
+
+    @staticmethod
+    def unm_24_41(payload):
+        """Convert byte to 0 to 262143.98 per UNM-24-41"""
+        return ((payload[0] << 16 | payload[1] << 8 | payload[2]) / 64) if len(payload) > 2 else None
+
+    @staticmethod
+    def unm_32_31(payload):
+        """Convert byte to 0 to 4194303.75 per UNM-32-31"""
+        return ((payload[0] << 24 | payload[1] << 16 | payload[2] << 8 | payload[3]) / 64) if len(payload) > 3 else None
+
+    # ASC (ASCII) methods
+    @staticmethod
+    def asc_32_1(payload):
+        """Convert bytes to ASCII string per ASC-32-1"""
+        return "".join(chr(b) for b in payload[0:4]) if len(payload) > 3 else None   
+
+    # PKT (Packet) methods
+    @staticmethod
+    def pkt_32_2(payload):
+        """Convert bytes to ASCII string per PKT-32-2"""
+        return chr(payload[3]) if len(payload) > 3 else None
+
 
 '''
 OBD class is used to communicate
@@ -203,6 +416,8 @@ class VPW_frame:
         0xFA:"VIN",
         0xFE:"Network Control",
     }
+
+
     
     '''
     Physical Module Addresses Used in GM VPW-based Vehicles.
@@ -218,242 +433,261 @@ class VPW_frame:
     Q bit is a single bit used to signal a binary state (i.e. On/Off)
     Ext Addr is the second data byte used to identify the physical location of the device
     PRN is the PRN of the message, which tells us how to do the math to get the actual value.
+
+    # Custom functions can still be defined inline if needed
+    # PRN can have inline definitions with a lambda function ["unit", lambda payload: custom_calculation(payload)],
+    # example: ["unit", lambda payload: (payload[0] * 1) / 2 if len(payload) > 0 else 0],
     '''
     secondary_ids = {
         0x12: {  # Throttle
-            0x01: ["Sensor 1 Position", "", "", "", "0011"],
-            0x02: ["Sensor 2 Position", "", "", "", "1035"],
-            0x03: ["Sensor 3 Position", "", "", "", "1036"],
-            0x10: ["Throttle Kicker", "E", "D", "", ""],
-            0x11: ["Throttle Position", "", "", "", "1034"],
+            0x01: ["Sensor 1 Position", "", "", "", ["%", PRD.unm_08_61]],
+            0x02: ["Sensor 2 Position", "", "", "", ["%", PRD.unm_08_61]],
+            0x03: ["Sensor 3 Position", "", "", "", ["%", PRD.unm_08_61]],
+            0x10: ["Throttle Kicker", "E", "D", "", None],
+            0x11: ["Throttle Position", "", "", "", ["%", PRD.unm_08_61]],
         },
         0x1A: {  # Engine RPM
-            0x01: ["Low Res RPM", "", "", "", "1022"],
-            0x02: ["High Res RPM", "", "", "", "000C"],
-            0x10: ["High Res RPM", "", "", "", "000C"], # Found on 2001 C5 Z06
-            0x20: ["Idle Speed", "Enabled", "Disabled", "", "1023"],
+            0x01: ["Low Res RPM", "", "", "", ["rpm", PRD.unm_08_71]],
+            0x02: ["High Res RPM", "", "", "", ["rpm", PRD.unm_16_31]],
+            0x10: ["High Res RPM", "", "", "", ["rpm", PRD.unm_16_31]], # Found on 2001 C5 Z06
+            0x20: ["Idle Speed", "Enabled", "Disabled", "", ["rpm", PRD.unm_08_161]],
         },
-        0x32: {  # Brakes
-            0x03: ["ABS Active", "Y", "N", "", ""],
-            0x04: ["ABS System On / Off", "On", "Off", "", ""],
-            0x09: ["Fluid Life Reset", "R", "~R", "", ""],
-            0x0A: ["System Faulted", "Y", "N", "", ""],
-            0x10: ["Fluid Temperature", "", "", "", "281A"],
-            0x11: ["Supply Pump Fluid Pressure", "", "", "", "2819"],
-            0x12: ["Fluid Level - Percent", "", "", "", "2841"],
-            0x13: ["Fluid Level - Volume", "", "", "", "2842"],
-            0x14: ["Fluid Remaining Life", "", "", "", "2843"],
-            0x16: ["Fluid Capacity", "", "", "", "2844"],
-            0x20: ["Parking Brake Sw. Active", "Y", "N", "", ""],
-            0x21: ["Torque Convertor Clutch - Brake Sw. Active", "Y", "N", "", ""],
-            0x22: ["Brake Lamp - Brake Sw. Active", "Y", "N", "", ""],
-            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", ""],
+        0x28: { # Vehicle Speed
+            0x01: ["Vehicle Speed", "", "", "", ["km/h", PRD.unm_08_101]],
+            0x02: ["Vehicle Speed", "", "", "", ["km/h", PRD.unm_16_5]],
+        },
+        0x32: { # Brakes
+            0x03: ["ABS Active", "Y", "N", "", None],
+            0x04: ["ABS System On / Off", "On", "Off", "", None],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x0A: ["System Faulted", "Y", "N", "", None],
+            0x10: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x11: ["Supply Pump Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_171]],
+            0x12: ["Fluid Level - Percent", "", "", "", ["%", PRD.unm_08_71]],
+            0x13: ["Fluid Level - Volume", "", "", "", ["L", PRD.unm_08_15]],
+            0x14: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x16: ["Fluid Capacity", "", "", "", ["L", PRD.unm_08_15]],
+            0x20: ["Parking Brake Sw. Active", "Y", "N", "", None],
+            0x21: ["Torque Convertor Clutch - Brake Sw. Active", "Y", "N", "", None],
+            0x22: ["Brake Lamp - Brake Sw. Active", "Y", "N", "", None],
+            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
         },
         0x3A: { # Transmission
-            0x01: ["Torque Convertor Lock(ed)", "Y", "N", "", ""],
-            0x02: ["Clutch Enable", "E", "D", "", ""],
-            0x03: ["Actual Gear Position w/ Shift in Progress", "Y", "N", "", "180E"],
-            0x04: ["Range Selected (PRNDL position)", "", "", "", "1809"],
-            0x05: ["Transfer Case (4WD)", "", "", "", "180A"],
-            0x06: ["Commanded Gear", "", "", "", "180D"],
-            0x07: ["Range Actual (PRNDL sense at transmission)", "", "", "", "1806"],
-            0x08: ["Transmission Kickdown", "Y", "N", "", ""],
-            0x09: ["Fluid Life Reset", "R", "~R", "", ""],
-            0x0A: ["Fluid Temperature", "", "", "", "180B"],
-            0x0B: ["Fluid Pressure", "", "", "", "180C"],
-            0x0C: ["Fluid Level - Percent", "", "", "", "1801"],
-            0x0D: ["Fluid Level - Volume", "", "", "", "1802"],
-            0x0E: ["Fluid Remaining Life", "", "", "", "1804"],
-            0x10: ["Fluid Capacity", "", "", "", "1803"],
-            0x14: ["Park/Neutral Sw. Active", "Y", "N", "", ""],
-            0x1D: ["Fluid Life Reset Sw. Active", "Y", "N", "", ""],
+            0x01: ["Torque Convertor Lock(ed)", "Y", "N", "", None],
+            0x02: ["Clutch Enable", "E", "D", "", None],
+            0x03: ["Actual Gear Position w/ Shift in Progress", "Y", "N", "", ["", PRD.sed_08_4]],
+            0x04: ["Range Selected (PRNDL position)", "", "", "", ["", PRD.sed_08_4]],
+            0x05: ["Transfer Case (4WD)", "", "", "", ["", PRD.sed_08_6]],
+            0x06: ["Commanded Gear", "", "", "", ["", PRD.sed_08_4]],
+            0x07: ["Range Actual (PRNDL sense at transmission)", "", "", "", ["", PRD.sed_08_4]],
+            0x08: ["Transmission Kickdown", "Y", "N", "", None],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x0A: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x0B: ["Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_151]],
+            0x0C: ["Fluid Level - Percent", "", "", "", ["%", PRD.unm_08_71]],
+            0x0D: ["Fluid Level - Volume", "", "", "", ["L", PRD.unm_08_41]],
+            0x0E: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x10: ["Fluid Capacity", "", "", "", ["L", PRD.unm_08_41]],
+            0x14: ["Park/Neutral Sw. Active", "Y", "N", "", None],
+            0x1D: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+        },
+        0x48: { # Engine Coolant
+            0x10: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x32: ["Low Coolant Level", "Y", "N", "", None],
         },
         0x4A: { # Engine Oil
-            0x09: ["Fluid Life Reset", "R", "~R", "", ""],
-            0x10: ["Fluid Temperature", "", "", "", "102B"],
-            0x11: ["Fluid Pressure", "", "", "", "102F"],
-            0x12: ["Fluid Level - Percent", "", "", "", "102C"],
-            0x13: ["Fluid Level - Volume", "", "", "", "102D"],
-            0x14: ["Fluid Remaining Life", "", "", "", "1030"],
-            0x15: ["Oil Viscosity", "", "", "", "103F"],
-            0x16: ["Fluid Capacity", "", "", "", "102E"],
-            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", ""],
-            0x30: ["Fluid Temperature High", "Y", "N", "", ""],
-            0x32: ["Low Oil Level", "Y", "N", "", ""],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x10: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x11: ["Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_141]],
+            0x12: ["Fluid Level - Percent", "", "", "", ["%", PRD.unm_08_71]],
+            0x13: ["Fluid Level - Volume", "", "", "", ["L", PRD.unm_08_41]],
+            0x14: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x15: ["Oil Viscosity", "", "", "", ["cSt.", PRD.unm_08_41]],
+            0x16: ["Fluid Capacity", "", "", "", ["L", PRD.unm_08_41]],
+            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+            0x30: ["Fluid Temperature High", "Y", "N", "", None],
+            0x32: ["Low Oil Level", "Y", "N", "", None],
         },
         0x52: { # Engine Systems - Other
             0x04: ["Engine Running", "Y", "N", "", ""],
         },
         0x72: {  # Charging System (Command ID)
-            0x01: ["Charging Voltage", "", "", "", "6035"],
-            0x02: ["Battery Voltage", "", "", "", "600A"],
-            0x0A: ["Battery Current", "", "", "", "6038"],
-            0x08: ["Cluster Voltage", "", "", "", "Z001"], # Found on 2001 C5 Z06
-            0x21: ["Charging System Faulted", "Y", "N", "", ""],
+            0x01: ["Charging Voltage", "", "", "", ["V", PRD.unm_08_32]],
+            0x02: ["Battery Voltage", "", "", "", ["V", PRD.unm_08_32]],
+            0x0A: ["Battery Current", "", "", "", ["A", PRD.unm_08_21]],
+            0x08: ["Cluster Voltage", "", "", "", ["V", PRD.unm_16_11]], # Found on 2001 C5 Z06
+            0x21: ["Charging System Faulted", "Y", "N", "", None],
+        },
+        0x7A: { # Odometer
+            0x01: ["Odometer", "", "", "", ["km", PRD.unm_32_31]],
+            0x02: ["Odometer", "", "", "", ["mi", PRD.unm_24_11]], # Found on 2001 C5 Z06
+            0x03: ["Trip Reset", "R", "~R", "", None],
+            0x04: ["Trip Odometer", "", "", "", ["km", PRD.unm_24_41]],
+            0x20: ["Trip Reset Sw. Active", "Y", "N", "", None],
         },
         0x82: {  # Fuel System
-            0x0A: ["Unknown Value", "", "", "", ""], # Found on 2001 C5 Z06
-            0x11: ["Fuel Pressure", "", "", "", "000A"],
-            0x13: ["Fuel Level - Volume", "", "", "", "6006"],
-            0x16: ["Fuel Capacity", "", "", "", "6007"],
-            0x32: ["Low Fuel Level", "Y", "N", "", ""],
+            0x0A: ["Unknown Value", "", "", "", None], # Found on 2001 C5 Z06
+            0x11: ["Fuel Pressure", "", "", "", ["kPa", PRD.unm_08_131]],
+            0x13: ["Fuel Level - Volume", "", "", "", ["L", PRD.unm_16_11]],
+            0x16: ["Fuel Capacity", "", "", "", ["L", PRD.unm_16_11]],
+            0x32: ["Low Fuel Level", "Y", "N", "", None],
         },
         0x86: { # Ignition
-            0x04: ["Ignition Switch Position", "", "", "", "1047"],
-            0x05: ["Key-In-Ignition", "Y", "N", "", ""],
+            0x04: ["Ignition Switch Position", "", "", "", ["", PRD.sed_08_5]],
+            0x05: ["Key-In-Ignition", "Y", "N", "", None],
         },
         0x88: {  # Tell Tales (Warnings)
-            0x01: ["Seatbelt", "On", "Off", "", ""],
-            0x02: ["Service Engine Soon", "On", "Off", "", ""],
-            0x03: ["Check Engine (MIL)", "On", "Off", "", ""],
-            0x04: ["High Beam Indicator", "On", "Off", "", ""],
-            0x05: ["Left Turn Indicator", "On", "Off", "", ""],
-            0x06: ["Right Turn Indicator", "On", "Off", "", ""],
-            0x07: ["Airbag", "On", "Off", "", ""],
-            0x08: ["Anti-Lock Brake System Failed", "On", "Off", "0", ""],
-            0x09: ["Traction Control System Failed", "On", "Off", "0", ""],
-            0x0A: ["Security", "On", "Off", "0", ""],
-            0x0B: ["Low Fuel", "On", "Off", "0", ""],
-            0x0C: ["Low Coolant", "On", "Off", "0", ""],
-            0x0D: ["Low Oil", "On", "Off", "0", ""],
-            0x0E: ["Low Voltage", "On", "Off", "0", ""],
-            0x0F: ["Upshift", "On", "Off", "0", ""],
-            0x10: ["Low Washer Fluid", "On", "Off", "0", ""],
-            0x11: ["Traction Control Active", "On", "Off", "0", ""],
-            0x12: ["Alternator Failure", "On", "Off", "0", ""],
-            0x13: ["Low Brake Fluid", "On", "Off", "0", ""],
-            0x14: ["Overdrive", "On", "Off", "0", ""],
-            0x15: ["Traction Control Disabled", "On", "Off", "0", ""],
-            0x21: ["Convertible Latch Warning", "On", "Off", "0", ""],
-            0x22: ["Super Lock System Warning", "On", "Off", "0", ""],
-            0x23: ["Catalyst Over Temperature", "On", "Off", "0", ""],
-            0x24: ["Vehicle Speed Control", "On", "Off", "0", ""]
+            0x01: ["Seatbelt", "On", "Off", "", None],
+            0x02: ["Service Engine Soon", "On", "Off", "", None],
+            0x03: ["Check Engine (MIL)", "On", "Off", "", None],
+            0x04: ["High Beam Indicator", "On", "Off", "", None],
+            0x05: ["Left Turn Indicator", "On", "Off", "", None],
+            0x06: ["Right Turn Indicator", "On", "Off", "", None],
+            0x07: ["Airbag", "On", "Off", "", None],
+            0x08: ["Anti-Lock Brake System Failed", "On", "Off", "0", None],
+            0x09: ["Traction Control System Failed", "On", "Off", "0", None],
+            0x0A: ["Security", "On", "Off", "0", None],
+            0x0B: ["Low Fuel", "On", "Off", "0", None],
+            0x0C: ["Low Coolant", "On", "Off", "0", None],
+            0x0D: ["Low Oil", "On", "Off", "0", None],
+            0x0E: ["Low Voltage", "On", "Off", "0", None],
+            0x0F: ["Upshift", "On", "Off", "0", None],
+            0x10: ["Low Washer Fluid", "On", "Off", "0", None],
+            0x11: ["Traction Control Active", "On", "Off", "0", None],
+            0x12: ["Alternator Failure", "On", "Off", "0", None],
+            0x13: ["Low Brake Fluid", "On", "Off", "0", None],
+            0x14: ["Overdrive", "On", "Off", "0", None],
+            0x15: ["Traction Control Disabled", "On", "Off", "0", None],
+            0x21: ["Convertible Latch Warning", "On", "Off", "0", None],
+            0x22: ["Super Lock System Warning", "On", "Off", "0", None],
+            0x23: ["Catalyst Over Temperature", "On", "Off", "0", None],
+            0x24: ["Vehicle Speed Control", "On", "Off", "0", None]
         },
         0xB2: {  # HVAC (Climate Control)
-            0x02: ["Blower Fan Speed", "", "", "", ""],
-            0x06: ["Multi-Zone Mode", "E", "D", "", ""],
-            0x07: ["Low Refrigerant", "Y", "N", "", ""],
-            0x09: ["Fluid Life Reset", "R", "~R", "", ""],
-            0x0A: ["HVAC Set Temperature", "", "", "8.2", "9820"],
-            0x10: ["High Side Fluid Temperature", "", "", "", "9808"],
-            0x11: ["High Side Fluid Pressure", "", "", "", "9813"],
-            0x12: ["Fluid Charge - Percent", "", "", "", "980B"],
-            0x13: ["Fluid Charge - Weight", "", "", "", "980C"],
-            0x14: ["Fluid Remaining Life", "", "", "", "980D"],
-            0x16: ["Fluid Capacity - Weight", "", "", "", "980E"],
-            0x20: ["Low Side Fluid Temperature", "", "", "", "9809"],
-            0x21: ["Low Side Fluid Pressure", "", "", "", "980A"],
-            0x22: ["Fan Increment Speed Sw. Active", "Y", "N", "", ""],
-            0x23: ["Fan Decrement Speed Sw. Active", "Y", "N", "", ""],
-            0x26: ["Multi-Zone Mode Sw. Active", "Y", "N", "", ""],
-            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", ""],
-            0x2A: ["Increment Temp Sw. Active", "Y", "N", "", ""],
-            0x2B: ["Decrement Temp Sw. Active", "Y", "N", "", ""],
+            0x02: ["Blower Fan Speed", "", "", "", None],
+            0x06: ["Multi-Zone Mode", "E", "D", "", None],
+            0x07: ["Low Refrigerant", "Y", "N", "", None],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x0A: ["HVAC Set Temperature", "", "", "8.2", ["°C", PRD.unm_08_73]],
+            0x10: ["High Side Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x11: ["High Side Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_159]],
+            0x12: ["Fluid Charge - Percent", "", "", "", ["%", PRD.unm_08_61]],
+            0x13: ["Fluid Charge - Weight", "", "", "", ["g", PRD.unm_08_155]],
+            0x14: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x16: ["Fluid Capacity - Weight", "", "", "", ["g", PRD.unm_08_155]],
+            0x20: ["Low Side Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x21: ["Low Side Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_125]],
+            0x22: ["Fan Increment Speed Sw. Active", "Y", "N", "", None],
+            0x23: ["Fan Decrement Speed Sw. Active", "Y", "N", "", None],
+            0x26: ["Multi-Zone Mode Sw. Active", "Y", "N", "", None],
+            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+            0x2A: ["Increment Temp Sw. Active", "Y", "N", "", None],
+            0x2B: ["Decrement Temp Sw. Active", "Y", "N", "", None],
         },
         0xC4: {  # Door Locks
-            0x01: ["Lock", "L", "U", "8.5", ""],
-            0x02: ["Unlock Enable", "E", "D", "8.5", ""],
-            0x03: ["Lock Cylinder Secure", "Y", "N", "8.5", ""],
-            0x04: ["Key-in-Lock Cylinder", "Y", "N", "8.5", ""],
-            0x05: ["Master Controller Lock", "L", "N", "8.5", ""],
-            0x06: ["Lock Cylinder State", "L", "U", "8.5", "A010"],
-            0x07: ["Super/Double Lock", "L", "U", "8.5", ""],
-            0x08: ["Remote Lock w/ Transmitter ID", "L", "U", "8.5", "C001"],
-            0x09: ["Remote Lock", "L", "U", "8.5", ""],
-            0x20: ["Lock Sw Active", "Y", "N", "8.5", ""],
-            0x21: ["Unlock Sw Active", "Y", "N", "8.5", ""],
-            0x22: ["Unlock Enable Sw Active", "Y", "N", "8.5", ""],
-            0x25: ["Master Lock Sw Active", "Y", "N", "8.5", ""],
-            0x26: ["Master Unlock Sw Active", "Y", "N", "8.5", ""],
+            0x01: ["Lock", "L", "U", "8.5", None],
+            0x02: ["Unlock Enable", "E", "D", "8.5", None],
+            0x03: ["Lock Cylinder Secure", "Y", "N", "8.5", None],
+            0x04: ["Key-in-Lock Cylinder", "Y", "N", "8.5", None],
+            0x05: ["Master Controller Lock", "L", "N", "8.5", None],
+            0x06: ["Lock Cylinder State", "L", "U", "8.5", ["", PRD.sed_08_7]],
+            0x07: ["Super/Double Lock", "L", "U", "8.5", None],
+            0x08: ["Remote Lock w/ Transmitter ID", "L", "U", "8.5", ["", PRD.unm_08_101]],
+            0x09: ["Remote Lock", "L", "U", "8.5", None],
+            0x20: ["Lock Sw Active", "Y", "N", "8.5", None],
+            0x21: ["Unlock Sw Active", "Y", "N", "8.5", None],
+            0x22: ["Unlock Enable Sw Active", "Y", "N", "8.5", None],
+            0x25: ["Master Lock Sw Active", "Y", "N", "8.5", None],
+            0x26: ["Master Unlock Sw Active", "Y", "N", "8.5", None],
         },
         0xC6: {  # External Access
-            0x01: ["Open", "Y", "N", "8.5", ""],
-            0x02: ["Close", "Y", "N", "8.5", ""],
-            0x11: ["Remote Open/Close w/ Transmitter ID", "Open", "Close", "8.5", "C001"],
-            0x12: ["Remote Open/Close", "Open", "Close", "8.5", ""],
-            0x21: ["Ajar Sw. Active", "Y", "N", "8.5", ""],
-            0x22: ["Door Handle Sw. Active", "Y", "N", "8.5", ""],
-            0x23: ["Door Jamb Sw. Active", "Y", "N", "8.5", ""],
+            0x01: ["Open", "Y", "N", "8.5", None],
+            0x02: ["Close", "Y", "N", "8.5", None],
+            0x11: ["Remote Open/Close w/ Transmitter ID", "Open", "Close", "8.5", ["", PRD.unm_08_101]],
+            0x12: ["Remote Open/Close", "Open", "Close", "8.5", None],
+            0x21: ["Ajar Sw. Active", "Y", "N", "8.5", None],
+            0x22: ["Door Handle Sw. Active", "Y", "N", "8.5", None],
+            0x23: ["Door Jamb Sw. Active", "Y", "N", "8.5", None],
         },
         0xD2: { # Restraints
-            0x01: ["Passive Restraint Enagaged", "Y", "N", "8.6", ""],
-            0x02: ["Passive Restraint Retracted", "Y", "N", "8.6", ""],
-            0x03: ["Passive Restraint Attached", "Y", "N", "8.6", ""],
-            0x04: ["Seatbelt Attached", "Y", "N", "8.6", ""],
-            0x05: ["Shoulder Adjustment Up Motion", "En", "Dis", "8.6", ""],
-            0x06: ["Shoulder Adjustment Down Motion", "En", "Dis", "8.6", ""],
-            0x07: ["Air Bag Deployed", "Y", "N", "8.6", ""],
+            0x01: ["Passive Restraint Enagaged", "Y", "N", "8.6", None],
+            0x02: ["Passive Restraint Retracted", "Y", "N", "8.6", None],
+            0x03: ["Passive Restraint Attached", "Y", "N", "8.6", None],
+            0x04: ["Seatbelt Attached", "Y", "N", "8.6", None],
+            0x05: ["Shoulder Adjustment Up Motion", "En", "Dis", "8.6", None],
+            0x06: ["Shoulder Adjustment Down Motion", "En", "Dis", "8.6", None],
+            0x07: ["Air Bag Deployed", "Y", "N", "8.6", None],
         },
         0xDA: {  # Exterior Lamps
-            0x01: ["Headlamp", "On", "Off", "8.8", ""],
-            0x02: ["Tail Lamp", "On", "Off", "8.8", ""],
-            0x03: ["Brake Lamp", "On", "Off", "8.8", ""],
-            0x04: ["Park Lamp", "On", "Off", "8.8", ""],
-            0x05: ["Turn Lamp", "On", "Off", "8.8", ""],
-            0x06: ["High Beam Lamp", "On", "Off", "8.8", ""],
-            0x07: ["Hazard Lamp", "On", "Off", "8.8", ""],
-            0x08: ["Reverse Lamp", "On", "Off", "8.8", ""],
-            0x09: ["Fog Lamp", "On", "Off", "8.8", ""],
-            0x0A: ["Daytime Running Lamp", "On", "Off", "8.8", ""],
-            0x0B: ["Spot Lamp", "On", "Off", "8.8", ""],
-            0x0C: ["Cargo Lamp", "On", "Off", "8.8", ""],
-            0x0D: ["Cornering Lamp", "On", "Off", "8.8", ""],
-            0x0E: ["Driving Lamp", "On", "Off", "8.8", ""],
-            0x0F: ["Coach Lamp", "On", "Off", "8.8", ""],
-            0x10: ["Autolamp Delay", "E", "D", "8.8", "A014"],
-            0x11: ["Flash-to-Pass", "E", "D", "8.8", ""],
-            0x12: ["Remote Headlamp On/Off w/Transmitter ID", "On", "Off", "8.8", "C001"],
-            0x13: ["Remote Headlamp", "On", "Off", "8.8", ""],
-            0x21: ["Headlamp Sw. Active", "Y", "N", "8.8", ""],
-            0x22: ["Right Turn Sw. Active", "Y", "N", "8.8", ""],
-            0x24: ["Park Lamp Sw. Active", "Y", "N", "8.8", ""],
-            0x25: ["Left Turn Sw. Active", "Y", "N", "8.8", ""],
-            0x26: ["High Beam Sw. Active", "Y", "N", "8.8", ""],
-            0x27: ["Hazard Sw. Active", "Y", "N", "8.8", ""],
-            0x28: ["Fog Lamp Sw. Active", "Y", "N", "8.8", ""],
-            0x29: ["Driving Lamp Sw. Active", "Y", "N", "8.8", ""]
+            0x01: ["Headlamp", "On", "Off", "8.8", None],
+            0x02: ["Tail Lamp", "On", "Off", "8.8", None],
+            0x03: ["Brake Lamp", "On", "Off", "8.8", None],
+            0x04: ["Park Lamp", "On", "Off", "8.8", None],
+            0x05: ["Turn Lamp", "On", "Off", "8.8", None],
+            0x06: ["High Beam Lamp", "On", "Off", "8.8", None],
+            0x07: ["Hazard Lamp", "On", "Off", "8.8", None],
+            0x08: ["Reverse Lamp", "On", "Off", "8.8", None],
+            0x09: ["Fog Lamp", "On", "Off", "8.8", None],
+            0x0A: ["Daytime Running Lamp", "On", "Off", "8.8", None],
+            0x0B: ["Spot Lamp", "On", "Off", "8.8", None],
+            0x0C: ["Cargo Lamp", "On", "Off", "8.8", None],
+            0x0D: ["Cornering Lamp", "On", "Off", "8.8", None],
+            0x0E: ["Driving Lamp", "On", "Off", "8.8", None],
+            0x0F: ["Coach Lamp", "On", "Off", "8.8", None],
+            0x10: ["Autolamp Delay", "E", "D", "8.8", ["s", PRD.unm_08_101]],
+            0x11: ["Flash-to-Pass", "E", "D", "8.8", None],
+            0x12: ["Remote Headlamp On/Off w/Transmitter ID", "On", "Off", "8.8", ["", PRD.unm_08_101]],
+            0x13: ["Remote Headlamp", "On", "Off", "8.8", None],
+            0x21: ["Headlamp Sw. Active", "Y", "N", "8.8", None],
+            0x22: ["Right Turn Sw. Active", "Y", "N", "8.8", None],
+            0x24: ["Park Lamp Sw. Active", "Y", "N", "8.8", None],
+            0x25: ["Left Turn Sw. Active", "Y", "N", "8.8", None],
+            0x26: ["High Beam Sw. Active", "Y", "N", "8.8", None],
+            0x27: ["Hazard Sw. Active", "Y", "N", "8.8", None],
+            0x28: ["Fog Lamp Sw. Active", "Y", "N", "8.8", None],
+            0x29: ["Driving Lamp Sw. Active", "Y", "N", "8.8", None]
         },
         0xDE: {  # Interior Lamps
-            0x01: ["Courtesy Lamp", "On", "Off", "8.9", ""],
-            0x02: ["Dome Lamp", "On", "Off", "8.9", ""], 
-            0x03: ["Puddle Lamp", "On", "Off", "8.9", ""],
-            0x04: ["Vanity Mirror Lamp", "On", "Off", "8.9", ""],
-            0x05: ["Opera Lamp", "On", "Off", "8.9", ""],
-            0x06: ["Reading Lamp", "On", "Off", "8.9", ""],
-            0x07: ["Hood Lamp", "On", "Off", "8.9", ""],
-            0x08: ["Trunk Lamp", "On", "Off", "8.9", ""],
-            0x09: ["Glove Box Lamp", "On", "Off", "8.9", ""],
-            0x10: ["Illuminated Entry", "E", "D", "0", ""],
-            0x11: ["Display Brightness & External Lamps", "On", "Off", "0", "602B"],
-            0x21: ["Courtesy Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x22: ["Dome Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x23: ["Puddle Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x24: ["Vanity Mirror Sw. Active", "Y", "N", "8.9", ""],
-            0x25: ["Opera Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x26: ["Reading Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x27: ["Hood Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x28: ["Trunk Lamp Sw. Active", "Y", "N", "8.9", ""],
-            0x29: ["Glove Box Lamp Sw. Active", "Y", "N", "8.9", ""],
+            0x01: ["Courtesy Lamp", "On", "Off", "8.9", None],
+            0x02: ["Dome Lamp", "On", "Off", "8.9", None], 
+            0x03: ["Puddle Lamp", "On", "Off", "8.9", None],
+            0x04: ["Vanity Mirror Lamp", "On", "Off", "8.9", None],
+            0x05: ["Opera Lamp", "On", "Off", "8.9", None],
+            0x06: ["Reading Lamp", "On", "Off", "8.9", None],
+            0x07: ["Hood Lamp", "On", "Off", "8.9", None],
+            0x08: ["Trunk Lamp", "On", "Off", "8.9", None],
+            0x09: ["Glove Box Lamp", "On", "Off", "8.9", None],
+            0x10: ["Illuminated Entry", "E", "D", "0", None],
+            0x11: ["Display Brightness & External Lamps", "On", "Off", "0", ["%", PRD.unm_08_61]],
+            0x21: ["Courtesy Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x22: ["Dome Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x23: ["Puddle Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x24: ["Vanity Mirror Sw. Active", "Y", "N", "8.9", None],
+            0x25: ["Opera Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x26: ["Reading Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x27: ["Hood Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x28: ["Trunk Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x29: ["Glove Box Lamp Sw. Active", "Y", "N", "8.9", None],
         },
         0xF2: { # External Environment
-            0x10: ["Outside Temperature", "", "", "", "602E"],
-            0x11: ["Barometric Pressure", "", "", "", "1025"],
-            0x13: ["Sun Load", "", "", "8.3", "9817"],
-            0x15: ["Photo Cell Dark", "Yes", "No", "8.3", ""]
+            0x10: ["Outside Temperature", "", "", "", ["°C", PRD.unm_08_73]],
+            0x11: ["Barometric Pressure", "", "", "", ["kPa", PRD.unm_08_101]],
+            0x13: ["Sun Load", "", "", "8.3", ["mW/CM^2", PRD.unm_08_71]],
+            0x15: ["Photo Cell Dark", "Yes", "No", "8.3", None]
         },
         0xFA: {  # VIN
-            0x01: ["VIN Dig 1", "", "", "", "E021"],
-            0x02: ["VIN Digit 2-5", "", "", "", "E022"],
-            0x03: ["VIN Digit 6-9", "", "", "", "E023"],
-            0x04: ["VIN Digit 10-13", "", "", "", "E024"],
-            0x05: ["VIN Digit 14-17", "", "", "", "E025"],
-            0x06: ["VIN RSVD", "", "", "", ""],
-            0x07: ["VIN RSVD", "", "", "", ""],
+            0x01: ["VIN Dig 1", "", "", "", ["", PRD.pkt_32_2]],
+            0x02: ["VIN Digit 2-5", "", "", "", ["", PRD.asc_32_1]],
+            0x03: ["VIN Digit 6-9", "", "", "", ["", PRD.asc_32_1]],
+            0x04: ["VIN Digit 10-13", "", "", "", ["", PRD.asc_32_1]],
+            0x05: ["VIN Digit 14-17", "", "", "", ["", PRD.asc_32_1]],
+            0x06: ["VIN RSVD", "", "", "", None],
+            0x07: ["VIN RSVD", "", "", "", None],
         },
         0xFE: {  # Network Control
-            0x02: ["Bus Wake-Up", "Y", "N", "", ""],
-            0x03: ["Node Alive", "Y", "N", "", ""],
-            0x04: ["Node Sleep", "Y", "N", "", ""],
+            0x02: ["Bus Wake-Up", "Y", "N", "", None],
+            0x03: ["Node Alive", "Y", "N", "", None],
+            0x04: ["Node Sleep", "Y", "N", "", None],
         }
     }
     
@@ -554,288 +788,9 @@ class VPW_frame:
         },
     }
 
-    # Common PRD functions - define once, reuse many times
-    # These are defined in SAE J2178-2
-    # Note that payload array starts at the first data byte, not the secondary ID
-    @staticmethod
-    def _prd_unm_08_15(payload):
-        """Convert 0-255 byte to 1/100 L per UNM-08-15"""
-        return (payload[0]) / 100 if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_21(payload):
-        """Convert 0-255 byte to 1/6 per UNM-08-21"""
-        return (payload[0]) / 16 if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_32(payload):
-        """Convert 0-255 byte to 1/16 per UNM-08-32"""
-        return (payload[0]) / 16 if len(payload) > 0 else 0
     
-    @staticmethod
-    def _prd_unm_08_41(payload):
-        """Convert 0-255 byte to 1/10 per UNM-08-41"""
-        return (payload[0]) / 10 if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_61(payload):
-        """Convert 0-255 byte to 0-100% per UNM-08-61"""
-        return (payload[0] * 100) / 255 if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_71(payload):
-        """Convert 0-255 byte to 0-100% per UNM-08-71"""
-        return (payload[0] / 2) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_73(payload):
-        """Convert 0-255 byte to -40 to 87.5°C per UNM-08-73"""
-        return (payload[0] / 2) - 40 if len(payload) > 0 else 0
-    
-    @staticmethod
-    def _prd_unm_08_101(payload):
-        """Convert byte to 0 to 255 per UNM-08-101"""
-        return (payload[0]) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_102(payload):
-        """Convert byte to temperature in Celsius (-40 to 215°C) per UNM-08-102"""
-        return payload[0] - 40 if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_125(payload):
-        """Convert byte to 0 to 637 per UNM-08-125"""
-        return (payload[0] * 5) / 2  if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_131(payload):
-        """Convert byte to 0 to 765 per UNM-08-131"""
-        return (payload[0] * 3) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_141(payload):
-        """Convert byte to 0 to 1048 per UNM-08-141"""
-        return (payload[0] * 4) if len(payload) > 0 else 0
-    
-    @staticmethod
-    def _prd_unm_08_151(payload):
-        """Convert byte to 0 to 2048 per UNM-08-151"""
-        return (payload[0] * 8) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_155(payload):
-        """Convert byte to 0 to 2550 g per UNM-08-155"""
-        return (payload[0] * 10) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_159(payload):
-        """Convert byte to 0 to 3570 per UNM-08-159"""
-        return (payload[0] * 14) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_161(payload):
-        """Convert byte to 0 to 4096 per UNM-08-161"""
-        return (payload[0] * 16) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_unm_08_171(payload):
-        """Convert byte to 0 to 8160 per UNM-08-171"""
-        return (payload[0] * 32) if len(payload) > 0 else 0
-
-    @staticmethod
-    def _prd_sed_08_7(payload):
-        """Convert byte to state string"""
-        if len(payload) == 0:
-            return None
-        if (payload[0] == 0):
-            return "Key Out"
-        elif (payload[0] == 1):
-            return "Key In Lock"
-        elif (payload[0] == 2):
-            return "Key In Unlock"
-        else:
-            return "Invalid"
-
-    @staticmethod
-    def _prd_sed_08_4(payload):
-        """Convert byte to Transmission state string"""
-        if len(payload) == 0:
-            return None
-        if (payload[0] == 0):
-            return "Unknown"
-        elif (payload[0] == 1):
-            return "Reverse"
-        elif (payload[0] == 2):
-            return "Forward 1"
-        elif (payload[0] == 4):
-            return "Forward 2"
-        elif (payload[0] == 8):
-            return "Forward 3"
-        elif (payload[0] == 16):
-            return "Forward 4"
-        elif (payload[0] == 32):
-            return "Forward 5"
-        elif (payload[0] == 64):
-            return "Forward 6/Park"
-        elif (payload[0] == 128):
-            return "Neutral"
-        else:
-            return "Invalid"
-
-    @staticmethod
-    def _prd_sed_08_5(payload):
-        """Convert byte to Ignition Switch Position state string"""
-        if len(payload) == 0:
-            return None
-        if (payload[0] == 1):
-            return "Accessory"
-        elif (payload[0] == 2):
-            return "Off / Lock"
-        elif (payload[0] == 4):
-            return "Off / Unlock"
-        elif (payload[0] == 8):
-            return "Run"
-        elif (payload[0] == 16):
-            return "Start"
-        else:
-            return "Invalid"
-
-    @staticmethod
-    def _prd_sed_08_6(payload):
-        """Convert byte to Transfer Case state string"""
-        if len(payload) == 0:
-            return None
-        if (payload[0] == 1):
-            return "Neutral"
-        elif (payload[0] == 2):
-            return "2WD High"
-        elif (payload[0] == 3):
-            return "4WD Low"
-        elif (payload[0] == 4):
-            return "4WD High"
-        else:
-            return "Invalid"
 
 
-    @staticmethod
-    def _prd_unm_16_11(payload):
-        """Convert byte to 0 to 655.35 per UNM-16-11"""
-        return (payload[0] << 8 | payload[1]) / 100 if len(payload) > 1 else None
-
-    @staticmethod
-    def _prd_unm_16_31(payload):
-        """Convert byte to 0 to 61383 per UNM-16-31"""
-        return (payload[0] << 8 | payload[1]) / 4 if len(payload) > 1 else None
-
-
-    @staticmethod
-    def _prd_asc_32_1(payload):
-        """Convert bytes to ASCII string per ASC-32-1"""
-        return "".join(chr(b) for b in payload[0:4]) if len(payload) > 3 else None   
-
-    @staticmethod
-    def _prd_pkt_32_2(payload):
-        """Convert bytes to ASCII string per PKT-32-2"""
-        return chr(payload[3]) if len(payload) > 3 else None   
-
-
-    # PRD (Parameter Response Data) array
-    # Maps PRD ID to [unit, math_function]
-    # Can reference common functions or define custom ones
-    prd = {
-        # Percentage functions (0-100%)
-        "0011": ["%", _prd_unm_08_61],  # Generic percentage
-        "102C": ["%", _prd_unm_08_71],  # Engine oil level - percent
-        "1030": ["%", _prd_unm_08_61],  # Engine oil remaining life
-        "1034": ["%", _prd_unm_08_61],  # Throttle Position %
-        "1035": ["%", _prd_unm_08_61],  # Throttle Position %
-        "1036": ["%", _prd_unm_08_61],  # Throttle Position %
-        "1801": ["%", _prd_unm_08_71],  # Transmission fluid level - percent
-        "1804": ["%", _prd_unm_08_61],  # Transmission fluid remaining life
-        "2841": ["%", _prd_unm_08_71],  # 1/2% Step sizes with 0 to 100% UNM-08-71
-        "2843": ["%", _prd_unm_08_61],  # Life percentage
-        "602B": ["%", _prd_unm_08_61],  # Brightness percentage
-        "980B": ["%", _prd_unm_08_61],  # Generic percentage
-        "980D": ["%", _prd_unm_08_61],  # Generic percentage
-        
-        # Temperature functions (-40 to 215°C)
-        "102B": ["°C", _prd_unm_08_102],  # Engine oil temperature
-        "180B": ["°C", _prd_unm_08_102],  # Transmission fluid temperature
-        "281A": ["°C", _prd_unm_08_102],  # Generic temperature
-        "9808": ["°C", _prd_unm_08_102],  # High side temperature
-        "9809": ["°C", _prd_unm_08_102],  # Low side temperature
-        "9820": ["°C", _prd_unm_08_73],   # HVAC temperature
-        "602E": ["°C", _prd_unm_08_73],   # Outside temperature
-        
-        # Pressure functions
-        "000A": ["kPa", _prd_unm_08_131],  # Fuel pressure
-        "102F": ["kPa", _prd_unm_08_141],  # Engine oil pressure
-        "180C": ["kPa", _prd_unm_08_151],  # Transmission fluid pressure
-        "2819": ["kPa", _prd_unm_08_171],  # Generic pressure
-        "980A": ["kPa", _prd_unm_08_125],  # Low side pressure
-        "9813": ["kPa", _prd_unm_08_159],  # High side pressure
-        "1025": ["kPa", _prd_unm_08_101],  # Barometric pressure
-
-        # Volume functions
-        "102D": ["L", _prd_unm_08_41],  # Engine oil level - volume
-        "102E": ["L", _prd_unm_08_41],  # Engine oil capacity
-        "1802": ["L", _prd_unm_08_41],  # Transmission fluid level - volume
-        "1803": ["L", _prd_unm_08_41],  # Transmission fluid capacity
-        "2842": ["L", _prd_unm_08_15],  # Volume in liters
-        "2844": ["L", _prd_unm_08_15],  # Capacity in liters
-        "6006": ["L", _prd_unm_16_11],  # Volume in liters
-        "6007": ["L", _prd_unm_16_11],  # Volume in liters
-
-        # Weight functions
-        "980C": ["g", _prd_unm_08_155],  # Weight in grams
-        "980E": ["g", _prd_unm_08_155],  # Weight in grams
-
-        # Time functions
-        "A014": ["s", _prd_unm_08_101],  # Time in seconds
-
-        # Motion/RPM functions
-        "1022": ["rpm", _prd_unm_08_71],  # Low resolution RPM
-        "000C": ["rpm", _prd_unm_16_31],  # High resolution RPM
-        "1023": ["rpm", _prd_unm_08_161],  # Idle speed
-        
-        # Heat functions
-        "9817": ["mW/CM^2", _prd_unm_08_71],  # Heat percentage
-
-        # Voltage functions
-        "6035": ["V", _prd_unm_08_32],  # Charging voltage
-        "600A": ["V", _prd_unm_08_32],  # Battery voltage
-
-        # Current functions
-        "6038": ["A", _prd_unm_08_21],  # Battery current
-
-        # State functions
-        "A010": ["", _prd_sed_08_7],  # Door lock state
-        "1047": ["", _prd_sed_08_5],  # Ignition switch position
-        "1806": ["", _prd_sed_08_4],  # Range Actual (PRNDL sense at transmission)
-        "1809": ["", _prd_sed_08_4],  # Range Selected (PRNDL position)
-        "180A": ["", _prd_sed_08_6],  # Transfer Case (4WD)
-        "180D": ["", _prd_sed_08_4],  # Commanded Gear
-        "180E": ["", _prd_sed_08_4],  # Actual Gear Position w/ Shift in Progress
-
-        # Other
-        "103F": ["cSt.", _prd_unm_08_41],  # Oil viscosity
-        "C001": ["", _prd_unm_08_101],  # Remote Transmitter ID/ID Number
-        "E021": ["", _prd_pkt_32_2],  # VIN Dig 1
-        "E022": ["", _prd_asc_32_1],  # VIN Dig 2-5
-        "E023": ["", _prd_asc_32_1],  # VIN Dig 6-9
-        "E024": ["", _prd_asc_32_1],  # VIN Dig 10-13
-        "E025": ["", _prd_asc_32_1],  # VIN Dig 14-17   
-       
-        # Custom possibly wrong PRDs
-        "Z001": ["V", _prd_unm_16_11],  # Cluster voltage (16 bit / 100)
-        
-        
-        # Custom functions can still be defined inline if needed
-        # "custom_id": ["unit", lambda payload: custom_calculation(payload)],
-        # example: "custom_id": ["unit", lambda payload: (payload[0] * 1) / 2 if len(payload) > 0 else 0],
-        
-        # Add more PRD entries as needed...
-    }
 
     phys_addresses = {
         0x10:"ECU",
@@ -962,52 +917,6 @@ class VPW_frame:
 
         return {'priority': priority, 'mode': mode, 'mode type': modeType, 'mode operation': modeOp, 'message': byteArray, 'heartbeat': isHeartBeat}
         
-    @staticmethod
-    def process_prd(prd_id, payload):
-        """
-        Process payload data using PRD (Parameter Response Data) calculations.
-        
-        Args:
-            prd_id (str): The PRD ID from the secondary_ids entry
-            payload (list): The message payload bytes
-            
-        Returns:
-            tuple: (calculated_value, unit) or (None, None) if PRD not found
-        """
-        if prd_id in VPW_frame.prd:
-            prd_info = VPW_frame.prd[prd_id]
-            unit = prd_info[0]
-            math_function = prd_info[1]
-            
-            # Check if we have enough data bytes for the calculation
-            if len(payload) <= 1:
-                return None, None
-                
-            try:
-                # Handle string references to static methods
-                if isinstance(math_function, str):
-                    if hasattr(VPW_frame, math_function):
-                        math_function = getattr(VPW_frame, math_function)
-                    else:
-                        print(f"Error: PRD {prd_id} function {math_function} not found")
-                        return None, None
-                
-                # Handle both function references and lambda functions
-                if callable(math_function):
-                    calculated_value = math_function(payload)
-                    # If the function returns None (insufficient data), return None
-                    if calculated_value is None:
-                        return None, None
-                else:
-                    print(f"Error: PRD {prd_id} math_function is not callable")
-                    return None, None
-                    
-                return calculated_value, unit
-            except (IndexError, ValueError, ZeroDivisionError) as e:
-                print(f"Error processing PRD {prd_id}: {e}")
-                return None, None
-        else:
-            return None, None
 
     @staticmethod
     def get_description(func_address, msg):
@@ -1088,9 +997,12 @@ class VPW_frame:
                     
                     # Process PRD if available (5th field) - for both F and F Ext messages
                     data_value = ""
-                    if len(info_list) >= 5 and len(info_list[4]) > 0:  # Both F and F Ext messages can have PRD
-                        prd_id = info_list[4]  # 5th field (index 4) - PRD ID
-                        if prd_id and prd_id != "":
+                    if len(info_list) >= 5 and info_list[4] is not None:  # Check if PRD data exists
+                        prd_data = info_list[4]  # 5th field (index 4) - PRD data [unit, function]
+                        if isinstance(prd_data, list) and len(prd_data) == 2:
+                            unit = prd_data[0]
+                            math_function = prd_data[1]
+                            
                             if is_extended:
                                 # For F Ext messages, PRD data starts at 3rd byte (skip secondary ID and ext address)
                                 data_payload = payload[2:] if len(payload) > 2 else []
@@ -1098,15 +1010,29 @@ class VPW_frame:
                                 # For regular F messages, PRD data starts at 2nd byte (skip secondary ID)
                                 data_payload = payload[1:] if len(payload) > 1 else []
                             
-                            calculated_value, unit = VPW_frame.process_prd(prd_id, data_payload)
-                            if calculated_value is not None:
-                                if isinstance(calculated_value, (int, float)):
-                                    data_value = f"{calculated_value:.2f} {unit}"
-                                else:
-                                    data_value = f"{calculated_value} {unit}"
+                            # Check if we have enough data bytes for the calculation
+                            if len(data_payload) > 1:  # Most PRD functions need at least 2 bytes
+                                try:
+                                    # Handle string references to static methods
+                                    if isinstance(math_function, str):
+                                        if hasattr(PRD, math_function):
+                                            math_function = getattr(PRD, math_function)
+                                        else:
+                                            print(f"Error: PRD function {math_function} not found")
+                                            return (data_value, result)
+                                    
+                                    if callable(math_function):
+                                        calculated_value = math_function(data_payload)
+                                        if calculated_value is not None:
+                                            if isinstance(calculated_value, (int, float)):
+                                                data_value = f"{calculated_value:.2f} {unit}"
+                                            else:
+                                                data_value = f"{calculated_value} {unit}"
+                                except (IndexError, ValueError, ZeroDivisionError) as e:
+                                    print(f"Error processing PRD: {e}")
                     
-                    # If no PRD data and message type is 'Report Stat', show Q-bit value in Data column
-                    if not data_value and msg.get('mode operation') == 'Report Stat' and len(info_list) >= 3:
+                    # If no PRD data and message type is 'Report Status', show Q-bit value in Data column
+                    if not data_value and msg.get('mode operation') == 'Report Status' and len(info_list) >= 3:
                         if q_bit == 1 and len(info_list) > 1:
                             data_value = info_list[1]  # Q-bit is 1, use 2nd field
                         elif q_bit == 0 and len(info_list) > 2:
