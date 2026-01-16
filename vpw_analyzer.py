@@ -245,6 +245,17 @@ class PRD:
     def pkt_32_2(payload):
         """Convert bytes to ASCII string per PKT-32-2"""
         return chr(payload[3]) if len(payload) > 3 else None
+    
+    @staticmethod
+    def dsp_c5_messages(payload):
+        """Convert bytes to ASCII string per DSP-C5-Messages"""
+        if (len(payload) < 1):
+            return None
+        if (payload[0] == 0x08) or (payload[0] == 0x01):
+            return "(Blinking)"
+        elif (payload[0] == 0x20) or (payload[0] == 0x40):
+            return "(Solid)"
+        return None
 
 
 '''
@@ -411,7 +422,7 @@ class VPW_frame:
         0xDE:"Interior Lamps",
         0xE4:"Tires",
         0xE6:"Defrost",
-        0xEA:"MFG Specific",
+        0xEA:"Display Commands",
         0xF2:"Ext Environment",
         0xFA:"VIN",
         0xFE:"Network Control",
@@ -594,6 +605,7 @@ class VPW_frame:
             0x07: ["Super/Double Lock", "L", "U", "8.5", None],
             0x08: ["Remote Lock w/ Transmitter ID", "L", "U", "8.5", ["", PRD.unm_08_101]],
             0x09: ["Remote Lock", "L", "U", "8.5", None],
+            0x10: ["Remote Lock Request", "L", "U", "8.5", None], # Found on 2001 C5 Z06
             0x20: ["Lock Sw Active", "Y", "N", "8.5", None],
             0x21: ["Unlock Sw Active", "Y", "N", "8.5", None],
             0x22: ["Unlock Enable Sw Active", "Y", "N", "8.5", None],
@@ -668,6 +680,9 @@ class VPW_frame:
             0x27: ["Hood Lamp Sw. Active", "Y", "N", "8.9", None],
             0x28: ["Trunk Lamp Sw. Active", "Y", "N", "8.9", None],
             0x29: ["Glove Box Lamp Sw. Active", "Y", "N", "8.9", None],
+        },
+        0xEA: { # Display Commands
+            0x20: ["Display", "Activate", "Deactivate", "DISP.C5", ["", PRD.dsp_c5_messages]], # Found on 2001 C5 Z06
         },
         0xF2: { # External Environment
             0x10: ["Outside Temperature", "", "", "", ["°C", PRD.unm_08_73]],
@@ -786,6 +801,37 @@ class VPW_frame:
             0x2C: "Dome Lamp",
             0x2E: "Passenger Side Rear",
         },
+        "DISP.C5": { # Display commands found on 2001 C5 Z06
+            0x81: "Change Oil Soon",
+            0x82: "Change Oil Now",
+            0x84: "Oil Level Low",
+            0x89: "Upshift Now",
+            0x8E: "Check Gauges",
+            0x8F: "Service Vehicle Soon (Ding)",
+            0x95: "Service ABS",
+            0x96: "ABS Active",
+            0x99: "Service Traction System",
+            0x9A: "Traction System Active",
+            0x9B: "(EBCM: Normal Mode On/Off)",
+            0x9E: "(Security Light Solid)",
+            0xA5: "Door Ajar",
+            0xA6: "Trunk Ajar",
+            0xAC: "Service TPMS",
+            0xAD: "Service Ride Control",
+            0xAE: "Service Vehicle Soon (No Ding)",
+            0xB7: "Reduced Engine Power",
+            0xB8: "Service Active Handling",
+            0xC2: "Active Handling Active",
+            0xCB: "High Trans Temp",
+            0xD0: "Hatch Ajar",
+            0xD3: "Active Handling Warming Up",
+            0xD4: "Warm Up Complete",
+            0xD5: "Max speed 159 mph",
+            0xDE: "Tonnaeu Ajar",
+            0xE8: "(EBCM: Comp Mode)",
+            0xE9: "Engine Protection, Reduce RPM",
+            0xEF: "(Brake Light Icon)",
+        }
     }
 
     
@@ -1031,8 +1077,8 @@ class VPW_frame:
                                 except (IndexError, ValueError, ZeroDivisionError) as e:
                                     print(f"Error processing PRD: {e}")
                     
-                    # If no PRD data and message type is 'Report Status', show Q-bit value in Data column
-                    if not data_value and msg.get('mode operation') == 'Report Status' and len(info_list) >= 3:
+                    # If no PRD data and message type is 'Report Status' or 'Load', show Q-bit value in Data column
+                    if not data_value and (msg.get('mode operation') in ['Report Status', 'Load']) and len(info_list) >= 3:
                         if q_bit == 1 and len(info_list) > 1:
                             data_value = info_list[1]  # Q-bit is 1, use 2nd field
                         elif q_bit == 0 and len(info_list) > 2:
@@ -1131,7 +1177,7 @@ class MessageManager():
             return
         
         if (summaryInd == -1):
-            self.messageSummary.append([len(self.messageSummary), 0, tempMsg[0], newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], data_value, description])
+            self.messageSummary.append([len(self.messageSummary), 1, tempMsg[0], newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], data_value, description])
             
             self.UIHook.new_message_summary(self.messageSummary[-1])
         else:
@@ -1595,7 +1641,7 @@ class Application(tk.Frame):
             try:
                 with open(file_path, "w") as fexport:
                     for line in self.mm.messageHistory:
-                        fexport.write(line[-1] + "\r\n")
+                        fexport.write(line[8] + "\r\n")  # line[8] is the raw hex data stream (inString)
                 print(f"Logs exported successfully to: {file_path}")
             except Exception as e:
                 print(f"Error exporting logs: {e}")
@@ -1619,7 +1665,7 @@ class Application(tk.Frame):
     def new_message_summary(self, newMsg):        
         # Print the message to the message history tree
         self.summaryTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
-                             values=(newMsg[0], 0, "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
+                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
                              newMsg[8], newMsg[4], newMsg[5], str(" ".join(["{:02X}".format(x) for x in newMsg[9][:-1]])), newMsg[10], newMsg[11]))
         #self.sid = self.sid + 1
         
