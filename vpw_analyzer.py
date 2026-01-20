@@ -24,15 +24,118 @@ from logging import exception
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import tkinter.ttk as ttk
-import binascii
 import queue
 import threading
 import time
-import pandas as pd  # Temporarily commented out for testing
-import string
 import serial
-import sys
 import re
+
+# Help text for the application
+HELP_TEXT = """VPW Analyzer Help
+==================
+
+HOW TO USE THE PROGRAM
+======================
+
+OBD Device Serial Port Field:
+• For serial communication: Enter the serial port path
+  - Linux: /dev/ttyUSB0, /dev/ttyACM0, etc.
+  - Windows: COM1, COM3, COM4, etc.
+• For file analysis: Enter the full path to a VPW log file
+  - Example: /home/user/vpw_log.txt
+  - Example: C:\\Users\\User\\Documents\\vpw_log.txt
+• Click "Read" to open the port/file and start parsing
+
+Raw Line Input:
+• Manually enter VPW messages for parsing
+• Format: 3-byte header + data + checksum/CRC
+• Example: 8C F1 10 11 80 24 5A
+• Click "Parse" to process the message
+
+Tips & Tricks:
+==============
+• Double-click any message in the Summary or Message History tables to automatically populate the Transmit Frame with that message's header and payload
+• Use Ctrl+A in any text field to select all text
+• The "Hide Module Heartbeats" option filters out routine heartbeat messages
+• Adjust "Compare First # Bytes" to control how messages are grouped in the summary table
+
+VPW Protocol Primer
+===================
+
+GM VPW Implementation Overview:
+GM's VPW (Variable Pulse Width) implementation uses a 3-byte header structure that includes the target address and source address (the module that sent the message).
+
+Addressing Modes:
+• Physical Address: Used for node-to-node communication (e.g., scan tool reading codes from a specific module)
+• Functional Address: Used for broadcast communication to multiple modules
+
+Message Types:
+The Mode column shows "F" for functional messages. Functional messages have several types:
+
+Command vs Status IDs:
+• Command IDs are always even numbers (e.g., $1A, $32, $48)
+• Status IDs are always the command ID + 1 (e.g., $1B, $33, $49)
+• Command = request/instruction, Status = response/confirmation
+
+Extended Address Messages:
+• "F Ext" in the Type column indicates Functional Extended Address
+• Provides additional location detail to functional messages
+• Examples: "front running lights only", "passenger door open"
+• Always includes a second data byte for location information
+
+Secondary IDs:
+• First data byte of any functional message is the Secondary ID
+• Provides "sub-fields" for the functional ID
+• Example: Engine RPM functional ID $1B (status) has:
+  - Secondary ID $02 = High resolution RPM
+  - Secondary ID $20 = Target idle speed
+  - Secondary ID $10 = Throttle position
+
+Extended Address Details:
+• If message type contains "F Ext", there will always be a second data byte
+• This byte provides physical location details for the secondary ID
+• Location byte varies depending on secondary ID and functional address used
+• Additional data bytes may follow for actual measurements
+
+Binary Flags:
+• Some secondary IDs are On/Off or Enabled/Disabled flags
+• Signaled by bit 7 (also called the Q-bit)of the secondary ID byte (first data byte)
+• Q-bit = 1: On/Enabled, Q-bit = 0: Off/Disabled
+
+Data Processing:
+• Additional data (like percentage readings) comes after the secondary ID
+• For F Ext messages: after secondary ID AND extended address
+• For regular F messages: after secondary ID only
+• PRD (Parameter Response Data) calculations convert raw bytes to meaningful values
+
+Message Structure Examples:
+==========================
+
+Regular Functional Message:
+Header: 8C F1 10
+Data:   11 80 24 5A
+• 8C = Priority/Header
+• F1 = Target Address (Functional)
+• 10 = Source Address (ECU)
+• 11 = Secondary ID
+• 80 = Data byte 1
+• 24 = Data byte 2
+• 5A = Checksum
+
+Extended Functional Message:
+Header: 8C F1 10
+Data:   11 22 80 24 5A
+• 8C = Priority/Header
+• F1 = Target Address (Functional)
+• 10 = Source Address (ECU)
+• 11 = Secondary ID
+• 22 = Extended Address (location detail)
+• 80 = Data byte 1
+• 24 = Data byte 2
+• 5A = Checksum
+
+For more detailed information about VPW protocol, refer to SAE J1850 and SAE J2178 standards.
+"""
 
 '''
 PRD (Parameter Response Data) class contains all data conversion methods
@@ -298,7 +401,7 @@ class OBD():
             self.sp.port = self.filename
             self.sp.open()
             
-            if (self.sp.is_open == False):
+            if (not self.sp.is_open):
                 raise Exception("Unable to open serial port")
                 
             
@@ -701,7 +804,7 @@ class VPW_frame:
         },
         0xFE: {  # Network Control
             0x02: ["Bus Wake-Up", "Y", "N", "", None],
-            0x03: ["Node Alive", "Y", "N", "", None],
+            0x03: ["Node Alive", "", "", "", None],
             0x04: ["Node Sleep", "Y", "N", "", None],
         }
     }
@@ -867,12 +970,12 @@ class VPW_frame:
     
     @staticmethod
     def process(byteString):
-        if (VPW_frame.is_valid(byteString) == False):
+        if (not VPW_frame.is_valid(byteString)):
             return None
         
         try:
             byteArray = bytearray.fromhex(byteString)
-        except:
+        except ValueError:
             print ("Issue processing: ", byteString)
             return None
             
@@ -951,7 +1054,7 @@ class VPW_frame:
             
         if (byteArray[0] & 0x10) == 0x10:
             mode = "?H"
-        if (byteArray[0] & 0x08) == 0x00:
+        if (not ifrBit):
             mode = "?IFR"
             
             # Check for heart beat
@@ -981,23 +1084,6 @@ class VPW_frame:
         
         # Extract Q-bit (bit 7) from first payload byte
         q_bit = (payload[0] & 0x80) >> 7
-        
-        # Extract C-bit (bit 6) from first payload byte
-        c_bit = (payload[0] & 0x40) >> 6
-        
-        # Extract TA[0] bit (bit 0 of target address)
-        ta_bit_0 = func_address & 0x01
-        
-        # Determine operation type based on TA[0] and C-bit
-        operation = ""
-        if ta_bit_0 == 1 and c_bit == 0:
-            operation = "Report"
-        elif ta_bit_0 == 0 and c_bit == 0:
-            operation = "Load"
-        elif ta_bit_0 == 0 and c_bit == 1:
-            operation = "Modify"
-        else:
-            operation = "Unknown"
         
         # Convert Status ID (odd) to Command ID (even) for lookup
         # Status IDs are always odd, Command IDs are always even
@@ -1065,6 +1151,7 @@ class VPW_frame:
                                             math_function = getattr(PRD, math_function)
                                         else:
                                             print(f"Error: PRD function {math_function} not found")
+                                            result = base_description
                                             return (data_value, result)
                                     
                                     if callable(math_function):
@@ -1264,10 +1351,9 @@ class ThreadedTask(threading.Thread):
         self.obd = OBD(self.file_path)
         self.obd.open()
         self.gui.update_obd_status(True,self.obd.dev_string)
-        threadPointer = threading.current_thread()
 
         
-        while (self.stop_var == False):
+        while (not self.stop_var):
             try:
                 #time.sleep(0.1)  # Simulate long running process
                 line = self.obd.read()
@@ -1671,12 +1757,10 @@ class Application(tk.Frame):
         
         
     def update_message_summary(self, index, newMsg):
-        values = self.summaryTree.item(index)
-        #print ("Updating UI: ", values, "and", newMsg)
         try:
             self.summaryTree.item(index, text=str(index),
                              values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], str(" ".join(["{:02X}".format(x) for x in newMsg[9][:-1]])), newMsg[10], newMsg[11]))
-        except:
+        except ValueError:
             print ("Issue updating index, ", newMsg)
             for child in self.summaryTree.get_children():
                 print(self.summaryTree.item(child)["values"])
@@ -1820,114 +1904,8 @@ class Application(tk.Frame):
         text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         
-        # Help content
-        help_text = """VPW Analyzer Help
-==================
-
-HOW TO USE THE PROGRAM
-======================
-
-OBD Device Serial Port Field:
-• For serial communication: Enter the serial port path
-  - Linux: /dev/ttyUSB0, /dev/ttyACM0, etc.
-  - Windows: COM1, COM3, COM4, etc.
-• For file analysis: Enter the full path to a VPW log file
-  - Example: /home/user/vpw_log.txt
-  - Example: C:\\Users\\User\\Documents\\vpw_log.txt
-• Click "Read" to open the port/file and start parsing
-
-Raw Line Input:
-• Manually enter VPW messages for parsing
-• Format: 3-byte header + data + checksum/CRC
-• Example: 8C F1 10 11 80 24 5A
-• Click "Parse" to process the message
-
-Tips & Tricks:
-==============
-• Double-click any message in the Summary or Message History tables to automatically populate the Transmit Frame with that message's header and payload
-• Use Ctrl+A in any text field to select all text
-• The "Hide Module Heartbeats" option filters out routine heartbeat messages
-• Adjust "Compare First # Bytes" to control how messages are grouped in the summary table
-
-VPW Protocol Primer
-===================
-
-GM VPW Implementation Overview:
-GM's VPW (Variable Pulse Width) implementation uses a 3-byte header structure that includes the target address and source address (the module that sent the message).
-
-Addressing Modes:
-• Physical Address: Used for node-to-node communication (e.g., scan tool reading codes from a specific module)
-• Functional Address: Used for broadcast communication to multiple modules
-
-Message Types:
-The Mode column shows "F" for functional messages. Functional messages have several types:
-
-Command vs Status IDs:
-• Command IDs are always even numbers (e.g., $1A, $32, $48)
-• Status IDs are always the command ID + 1 (e.g., $1B, $33, $49)
-• Command = request/instruction, Status = response/confirmation
-
-Extended Address Messages:
-• "F Ext" in the Type column indicates Functional Extended Address
-• Provides additional location detail to functional messages
-• Examples: "front running lights only", "passenger door open"
-• Always includes a second data byte for location information
-
-Secondary IDs:
-• First data byte of any functional message is the Secondary ID
-• Provides "sub-fields" for the functional ID
-• Example: Engine RPM functional ID $1B (status) has:
-  - Secondary ID $02 = High resolution RPM
-  - Secondary ID $20 = Target idle speed
-  - Secondary ID $10 = Throttle position
-
-Extended Address Details:
-• If message type contains "F Ext", there will always be a second data byte
-• This byte provides physical location details for the secondary ID
-• Location byte varies depending on secondary ID and functional address used
-• Additional data bytes may follow for actual measurements
-
-Binary Flags:
-• Some secondary IDs are On/Off or Enabled/Disabled flags
-• Signaled by bit 7 (also called the Q-bit)of the secondary ID byte (first data byte)
-• Q-bit = 1: On/Enabled, Q-bit = 0: Off/Disabled
-
-Data Processing:
-• Additional data (like percentage readings) comes after the secondary ID
-• For F Ext messages: after secondary ID AND extended address
-• For regular F messages: after secondary ID only
-• PRD (Parameter Response Data) calculations convert raw bytes to meaningful values
-
-Message Structure Examples:
-==========================
-
-Regular Functional Message:
-Header: 8C F1 10
-Data:   11 80 24 5A
-• 8C = Priority/Header
-• F1 = Target Address (Functional)
-• 10 = Source Address (ECU)
-• 11 = Secondary ID
-• 80 = Data byte 1
-• 24 = Data byte 2
-• 5A = Checksum
-
-Extended Functional Message:
-Header: 8C F1 10
-Data:   11 22 80 24 5A
-• 8C = Priority/Header
-• F1 = Target Address (Functional)
-• 10 = Source Address (ECU)
-• 11 = Secondary ID
-• 22 = Extended Address (location detail)
-• 80 = Data byte 1
-• 24 = Data byte 2
-• 5A = Checksum
-
-For more detailed information about VPW protocol, refer to SAE J1850 and SAE J2178 standards.
-"""
-        
-        text_widget.insert(tk.END, help_text)
+        # Help content (defined at top of file)
+        text_widget.insert(tk.END, HELP_TEXT)
         text_widget.config(state=tk.DISABLED)  # Make read-only
         
         # Add close button
@@ -1950,4 +1928,3 @@ if __name__ == "__main__" :
     app = Application(tk.Tk())
     app.root.wm_protocol("WM_DELETE_WINDOW", app.on_app_close)
     app.root.mainloop()
-
