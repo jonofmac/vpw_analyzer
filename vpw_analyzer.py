@@ -21,6 +21,7 @@ Changes
     - Query device string to get model and firmware info
 '''
 from logging import exception
+from enum import Enum
 import tkinter as tk
 from tkinter import messagebox, filedialog
 import tkinter.ttk as ttk
@@ -378,7 +379,7 @@ class OBD():
         self.dev_string = None
         
         # There is probably a better way to determine if something is a serial device or not.
-        if ("/dev" in filename or "COM" in filename or "com" in filename):
+        if filename.lower().startswith("com") or filename.startswith("/dev"):
             self.serial = True
         
 
@@ -1325,12 +1326,148 @@ class MessageManager():
         
         
 '''
+Device mode enumeration for type-safe state management
+'''
+class DeviceMode(Enum):
+    DISCONNECTED = "DISCONNECTED"
+    MONITOR_MODE = "MONITOR_MODE"
+    COMMAND_MODE = "COMMAND_MODE"
+
+
+'''
+ToolManager class manages the OBD device connection state and coordinates
+between the device and UI threads. It handles connection/disconnection,
+tracks device mode (monitor vs command), and manages message sending.
+'''
+class ToolManager:
+    def __init__(self, message_queue, status_callback=None):
+        """
+        Initialize the ToolManager
+        Args:
+            message_queue: Queue object to send messages to UI thread
+            status_callback: Optional callback function(status_connected, device_string) for status updates
+        """
+        self.message_queue = message_queue
+        self.status_callback = status_callback
+        self.obd = None
+        self.reading_thread = None
+        self.device_mode = DeviceMode.DISCONNECTED
+        self.is_connected = False
+        self.device_string = None
+        
+    def connect(self, file_path):
+        """
+        Connect to OBD device or open file
+        Args:
+            file_path: Path to serial port or file
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.is_connected:
+            self.disconnect()
+        
+        try:
+            self.reading_thread = ThreadedTask(self, self.message_queue, file_path)
+            self.reading_thread.start()
+            return True
+        except Exception as e:
+            print(f"Error connecting: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from OBD device and stop reading thread"""
+        if self.reading_thread:
+            self.reading_thread.stop()
+            self.reading_thread.join(3)
+            if self.reading_thread.is_alive():
+                print("Warning: Reading thread did not stop cleanly")
+            self.reading_thread = None
+        
+        if self.obd:
+            self.obd.close()
+            self.obd = None
+        
+        self.is_connected = False
+        self.device_mode = DeviceMode.DISCONNECTED
+        self.device_string = None
+        if self.status_callback:
+            self.status_callback(False, "")
+    
+    def on_device_connected(self, obd_instance, device_string):
+        """Called by reading thread when device is connected"""
+        self.obd = obd_instance
+        self.is_connected = True
+        self.device_mode = DeviceMode.MONITOR_MODE  # Device starts in monitor mode
+        self.device_string = device_string
+        if self.status_callback:
+            self.status_callback(True, device_string)
+    
+    def on_device_disconnected(self):
+        """Called when device disconnects"""
+        self.is_connected = False
+        self.device_mode = DeviceMode.DISCONNECTED
+        self.device_string = None
+        if self.status_callback:
+            self.status_callback(False, "")
+    
+    def get_device_mode(self):
+        """Get current device mode"""
+        return self.device_mode
+    
+    def is_in_monitor_mode(self):
+        """Check if device is in monitor mode"""
+        return self.device_mode == DeviceMode.MONITOR_MODE
+    
+    def is_in_command_mode(self):
+        """Check if device is in command mode"""
+        return self.device_mode == DeviceMode.COMMAND_MODE
+    
+    def send_message(self, header, payload):
+        """
+        Send a VPW message via the serial port
+        Args:
+            header: Header bytes as space-separated hex string (e.g., "8C F1 10")
+            payload: Payload bytes as space-separated hex string (e.g., "24 00")
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.obd or not self.is_connected:
+            return False
+        
+        if not self.obd.serial:
+            return False  # Can't send to file
+        
+        # Track mode transitions during send operation
+        # Device starts in MONITOR_MODE, transitions to COMMAND_MODE when exiting ATMA,
+        # then back to MONITOR_MODE after sending
+        if self.device_mode == DeviceMode.MONITOR_MODE:
+            self.device_mode = DeviceMode.COMMAND_MODE  # Will exit ATMA mode
+        
+        # Use the OBD's send_message method
+        success = self.obd.send_message(header, payload)
+        
+        # After sending, device should be back in monitor mode
+        if success:
+            self.device_mode = DeviceMode.MONITOR_MODE
+        else:
+            # If send failed, try to restore to monitor mode
+            # (OBD.send_message should handle this, but just in case)
+            self.device_mode = DeviceMode.MONITOR_MODE
+        
+        return success
+    
+    def get_obd_instance(self):
+        """Get the OBD instance (for direct access if needed)"""
+        return self.obd
+
+
+'''
 This class is used to run the serial/OBD class in a separate thread
 '''
 class ThreadedTask(threading.Thread):
-    def __init__(self, gui, queue, file_path):
+    def __init__(self, tool_manager, queue, file_path):
         threading.Thread.__init__(self)
-        self.gui = gui
+        self.tool_manager = tool_manager
         self.file_path = file_path
         self.stop_var = False
         self.obd = None
@@ -1350,7 +1487,9 @@ class ThreadedTask(threading.Thread):
 
         self.obd = OBD(self.file_path)
         self.obd.open()
-        self.gui.update_obd_status(True,self.obd.dev_string)
+        # Notify tool manager that device is connected
+        if self.tool_manager:
+            self.tool_manager.on_device_connected(self.obd, self.obd.dev_string)
 
         
         while (not self.stop_var):
@@ -1425,8 +1564,9 @@ Main application class that handles the GUI
 class Application(tk.Frame):
     def __init__(self, root):
         self.root = root
-        self.thread_reading = None
         self.queue = queue.Queue()
+        # Create ToolManager to handle OBD device state
+        self.tool_manager = ToolManager(self.queue, status_callback=self.update_obd_status)
         self.initialize_user_interface()
         self.update_status_bar(False)
         self.mm = MessageManager(self)
@@ -1782,15 +1922,8 @@ class Application(tk.Frame):
         
     def read_file(self):
         file_path = self.serial_port_entry.get()
-        
-        if (self.thread_reading):
-            # A thread exists already. Must mean it's already open. We must close/destroy it
-            self.thread_reading.stop()
-            self.thread_reading.join(3)
-            if (self.thread_reading.is_alive()):
-                print("Error ending thread...")
-        self.thread_reading = ThreadedTask(self, self.queue, file_path)
-        self.thread_reading.start()
+        # Use ToolManager to handle connection
+        self.tool_manager.connect(file_path)
 
     def update_ui(self):
         # Process any messages in the queue
@@ -1914,11 +2047,8 @@ class Application(tk.Frame):
 
     def on_app_close(self):
         if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
-            if (self.thread_reading):
-                self.thread_reading.stop()
-                self.thread_reading.join(3)
-                if (self.thread_reading.is_alive()):
-                    print("Error ending thread for app exit...")
+            # Disconnect via ToolManager
+            self.tool_manager.disconnect()
             self.root.destroy()
 
 
