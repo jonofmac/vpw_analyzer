@@ -35,6 +35,7 @@ import tkinter.ttk as ttk
 import queue
 import sys
 import threading
+from collections import deque
 import time
 import serial
 import re
@@ -159,6 +160,29 @@ def _vpw_payload_hex_for_transmit(payload_bytes):
     return _vpw_payload_hex_for_display(payload_bytes)
 
 
+# Datalog lines may start with relative receive time in seconds (exactly three fractional digits).
+_VPW_LOG_TIMESTAMP_PREFIX_RE = re.compile(r"^(\d+\.\d{3})\s+(.+)$")
+
+
+def _split_vpw_logfile_line(line):
+    """
+    Parse optional leading timestamp from a saved log line.
+    Returns (hex_line, relative_seconds_or_none). Timestamp must use exactly three decimal places.
+    """
+    s = (line or "").strip()
+    if not s:
+        return ("", None)
+    m = _VPW_LOG_TIMESTAMP_PREFIX_RE.match(s)
+    if m:
+        return (m.group(2).strip(), float(m.group(1)))
+    return (s, None)
+
+
+def _format_vpw_export_timestamp(seconds):
+    """Export / display relative time with exactly three decimal places."""
+    return f"{float(seconds):.3f}"
+
+
 # Help text for the application
 HELP_TEXT = """VPW Analyzer Help
 ==================
@@ -193,7 +217,9 @@ Tips & Tricks:
 • With focus in Summary or Message history, Space triggers Send Selected Message (same as the button)
 • Right-click a row in Summary or Message history: Add to queue (new queue or append to an existing one). Open Message queues from the transmit panel to reorder messages, double-click Header/Payload/Description to edit (Enter saves, Esc cancels), Export/Import JSON, or send an entire queue in order; use Load into transmit to copy the selected row to the transmit fields
 • "Show transmitted frames in message history" is on by default; turn it off if you do not want each successful send appended as a green-tagged row with a [TX] description prefix
-• "Try to decode ASCII in payload column" (under View Settings) keeps the normal space-separated hex and appends a bracketed run (e.g. [A~b]) with one character per byte for letters, digits, punctuation, and space, or ~ otherwise; transmit, Send Selected, and Add to queue still use raw hex from the stored frame only. Export logs always writes the original raw hex lines only
+• "Try to decode ASCII in payload column" (under View Settings) keeps the normal space-separated hex and appends a bracketed run (e.g. [A~b]) with one character per byte for letters, digits, punctuation, and space, or ~ otherwise; transmit, Send Selected, and Add to queue still use raw hex from the stored frame only
+• Live serial capture timestamps each frame when it is read from the adapter (ms internally, shown as seconds). Log files may optionally begin each line with a relative time in the form ``0.000`` (three decimal places), a space, then the hex frame; Read/Open accepts both formats
+• Export Logs opens a dialog: you can include those timestamps at the start of each line when the history has capture times (optional per-line if some rows have no time)
 
 VPW Protocol Primer
 ===================
@@ -516,6 +542,8 @@ class OBD():
         self._dvi_rx_buffer = bytearray()
         self._dvi_pending_lines = []
         self._sp_lock = threading.RLock()
+        # Monotonic clock value when VPW passive monitoring began (ATMA / DVI network on); used for RX timestamps.
+        self._vpw_capture_t0 = None
         
         # There is probably a better way to determine if something is a serial device or not.
         if filename.lower().startswith("com") or filename.startswith("/dev"):
@@ -599,7 +627,10 @@ class OBD():
                     break
                 rcmd, payload = popped
                 if rcmd == 0x7F:
-                    raise Exception(f"OBDX DVI fault: {payload.hex()}")
+                    raise Exception(
+                        f"OBDX DVI fault (request cmd 0x{cmd:02X}): payload {payload.hex()} "
+                        "(0x7F = device rejected the command; often busy or not ready right after DX DP 1)"
+                    )
                 if rcmd in (0x08, 0x09):
                     self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True))
                     continue
@@ -607,6 +638,28 @@ class OBD():
                     return payload
             time.sleep(0.002)
         raise Exception("OBDX DVI command timeout")
+
+    def _dvi_transact_setup_retry(self, cmd, data, timeout=3.0, max_attempts=4):
+        """
+        Send a DVI command during VPW monitor setup, retrying on transient 0x7F faults or timeouts.
+        USB / firmware sometimes NAKs the first 0x24/0x31 sequence right after ``DX DP 1``.
+        """
+        delays = (0.08, 0.15, 0.28)
+        for attempt in range(max_attempts):
+            try:
+                return self._dvi_transact(cmd, data, timeout=timeout)
+            except Exception as e:
+                es = str(e)
+                retryable = "OBDX DVI fault" in es or "OBDX DVI command timeout" in es
+                if not retryable or attempt >= max_attempts - 1:
+                    raise
+                if attempt < len(delays):
+                    time.sleep(delays[attempt])
+                else:
+                    time.sleep(0.35)
+                self.sp.reset_input_buffer()
+                self._dvi_rx_buffer.clear()
+                self._dvi_pending_lines.clear()
 
     def _open_obdx_dvi_vp_monitor(self):
         """Switch to DVI and enable VPW passive monitoring (OBDX Pro reference manual §3)."""
@@ -618,13 +671,15 @@ class OBD():
         self._dvi_rx_buffer.clear()
         self._dvi_pending_lines.clear()
         self.sp.reset_input_buffer()
+        time.sleep(0.06)
         # Timestamp off (default off; explicit), VPW protocol, network on — order per manual
         # §3.9.3: 24 02 03 NN — NN=00 timestamp off (explicit; default is off)
-        self._dvi_transact(0x24, [0x03, 0x00])
+        self._dvi_transact_setup_retry(0x24, [0x03, 0x00])
         # §3.11: "31 02 01 XX" = len 0x02, payload 0x01 (sub) + XX (VPW = 0x01)
-        self._dvi_transact(0x31, [0x01, 0x01])
+        self._dvi_transact_setup_retry(0x31, [0x01, 0x01])
         # "31 02 02 XX" = len 0x02, payload 0x02 (sub) + XX (network on = 0x01)
-        self._dvi_transact(0x31, [0x02, 0x01])
+        self._dvi_transact_setup_retry(0x31, [0x02, 0x01])
+        self._vpw_capture_t0 = time.perf_counter()
 
     def _recover_from_obdx_dvi_mode(self):
         """
@@ -657,7 +712,20 @@ class OBD():
         self.sp.write(b'atma\r\n')
         if (len(self.sp.read_until(b'\r\n')) == 0):
             raise Exception("Device did not enter atma mode")
-        
+        self._vpw_capture_t0 = time.perf_counter()
+
+    def _vpw_rx_timestamp_rel(self):
+        """Seconds since passive VPW capture started, or None if capture not armed."""
+        t0 = self._vpw_capture_t0
+        if t0 is None:
+            return None
+        return time.perf_counter() - t0
+
+    def reset_vpw_capture_epoch(self):
+        """Restart relative RX timestamps from now (live serial only). Used when clearing message logs."""
+        if self.serial:
+            self._vpw_capture_t0 = time.perf_counter()
+
     def open(self):
     
         if (self.serial):
@@ -774,11 +842,16 @@ class OBD():
             self.fd.close()
 
     def read(self):
+        """
+        Returns ``(line, recv_rel_sec)``.
+        ``line`` is a VPW hex line (often newline-terminated) or ``""`` at EOF / idle.
+        ``recv_rel_sec`` is seconds since VPW capture started on serial, from the log prefix when replaying a file, else None.
+        """
         if self.serial:
             with self._sp_lock:
                 if self.dvi_mode:
                     if self._dvi_pending_lines:
-                        return self._dvi_pending_lines.pop(0) + "\n"
+                        return (self._dvi_pending_lines.pop(0) + "\n", self._vpw_rx_timestamp_rel())
                     end = time.perf_counter() + (self.sp.timeout or 3.0)
                     while time.perf_counter() < end:
                         self._dvi_feed()
@@ -791,15 +864,31 @@ class OBD():
                                 print("OBDX DVI bus fault:", payload.hex())
                                 continue
                             if rcmd in (0x08, 0x09):
-                                return self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True) + "\n"
+                                return (
+                                    self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True) + "\n",
+                                    self._vpw_rx_timestamp_rel(),
+                                )
                             if rcmd in (0x20, 0x21):
                                 continue
                             print("OBDX DVI unsolicited frame cmd=%02X: %s" % (rcmd, payload.hex()))
                         time.sleep(0.002)
-                    return ""
-                return self.sp.readline().decode("utf-8")
+                    return ("", None)
+                ln = self.sp.readline().decode("utf-8")
+                if not ln:
+                    return ("", None)
+                return (ln, self._vpw_rx_timestamp_rel())
         else:
-            return self.fd.readline()
+            raw = self.fd.readline()
+            if raw == "":
+                return ("", None)
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            else:
+                text = raw.rstrip("\r\n")
+            hex_part, ts = _split_vpw_logfile_line(text)
+            if not hex_part:
+                return ("\n", None)
+            return (hex_part + "\n", ts)
 
     def send_message(self, header, payload):
         """Send a VPW frame. OBDX DVI: 0x10/0x11 while monitoring. ELM/STN: exit ATMA, AT SH, send, AT MA."""
@@ -1607,7 +1696,14 @@ class MessageManager():
         self.filter_compare_bytes = 2
         self.hide_heartbeat = False
         
-    def new_message(self, input_string, skip_summary=False, transmit_echo=False):
+    def new_message(
+        self,
+        input_string,
+        skip_summary=False,
+        transmit_echo=False,
+        recv_rel_sec=None,
+        live_serial_rx=False,
+    ):
         # Send string off to get parsed (add VPW CRC when missing so payload display matches ELM / bus)
         inString = _vpw_hex_line_append_crc_if_missing(input_string.rstrip())
         newMsg = VPW_frame.process(inString)
@@ -1663,12 +1759,32 @@ class MessageManager():
             else:
                 description = "[TX] (transmitted)"
         
-        # Append message to data frame (now includes data value and description)
-        self.messageHistory.append([len(self.messageHistory), newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], inString, data_value, description])
+        # Append message to data frame (…, raw hex line, data value, description, relative RX time in s or None)
+        self.messageHistory.append(
+            [
+                len(self.messageHistory),
+                newMsg["message"][0],
+                taModule,
+                saModule,
+                newMsg["priority"],
+                newMsg["mode"],
+                newMsg["mode type"],
+                newMsg["message"][3:],
+                inString,
+                data_value,
+                description,
+                recv_rel_sec,
+            ]
+        )
 
         tempMsg = self.messageHistory[-1]
         tree_tags = ("tx_frame",) if transmit_echo else ()
         self.UIHook.new_message(tempMsg, tags=tree_tags)
+        if live_serial_rx and not transmit_echo:
+            hx = "".join(inString.split())
+            bus_n = len(hx) // 2
+            if bus_n > 0:
+                self.UIHook.record_serial_rx_sample(bus_n)
         self.UIHook.update_status_bar(len(self.messageHistory))
         
         if skip_summary:
@@ -1902,35 +2018,54 @@ class ThreadedTask(threading.Thread):
         print(f"Starting file processing: {self.file_path}")
 
         self.obd = OBD(self.file_path)
-        self.obd.open()
+        try:
+            self.obd.open()
+        except Exception as e:
+            print(f"Failed to open / configure device: {e}")
+            try:
+                self.obd.close()
+            except Exception:
+                pass
+            self.obd = None
+            return
+
         # Notify tool manager that device is connected
         if self.tool_manager:
             self.tool_manager.on_device_connected(self.obd, self.obd.dev_string)
 
-        
-        while (not self.stop_var):
-            try:
-                #time.sleep(0.1)  # Simulate long running process
-                line = self.obd.read()
-                if self.stop_var:
-                    break
+        try:
+            while not self.stop_var:
+                try:
+                    # time.sleep(0.1)  # Simulate long running process
+                    line, recv_ts = self.obd.read()
+                    if self.stop_var:
+                        break
 
-                if not line:
-                    # End of file reached
+                    if not line:
+                        if not self.obd.serial:
+                            self.end_time = time.perf_counter()
+                            self.print_performance_stats()
+                            break
+                        continue
+
+                    if not line.strip():
+                        continue
+
+                    # Count and queue the message
+                    self.message_count += 1
+                    self.queue.put((line, recv_ts, self.obd.serial))
+                except Exception as e:
+                    print(f"Exception in file reading thread: {e}")
                     self.end_time = time.perf_counter()
                     self.print_performance_stats()
                     break
-                    
-                # Count and queue the message
-                self.message_count += 1
-                self.queue.put(line)
-            except Exception as e:
-                print(f"Exception in file reading thread: {e}")
-                self.end_time = time.perf_counter()
-                self.print_performance_stats()
-                break
-        
-        self.obd.close()
+        finally:
+            if self.obd is not None:
+                try:
+                    self.obd.close()
+                except Exception:
+                    pass
+                self.obd = None
 
     def stop(self):
         self.stop_var = True
@@ -1985,11 +2120,12 @@ class Application(tk.Frame):
         # Create ToolManager to handle OBD device state
         self.tool_manager = ToolManager(self.queue, status_callback=self.update_obd_status)
         self._last_send_selection = None
+        self._serial_rx_window = deque()
         self.initialize_user_interface()
-        self.update_status_bar(False)
         self.mm = MessageManager(self)
         self.message_queue_store = MessageQueueStore()
         self._message_queue_toplevel = None
+        self.update_status_bar(0)
         # Start the queue processing
         self.update_ui()
         if self._initial_open:
@@ -2017,6 +2153,7 @@ class Application(tk.Frame):
         
         ''' Variables for GUI '''
         self.statusBarString = tk.StringVar()
+        self.statusBarRxStatsString = tk.StringVar()
         self.statusBarOBDString = tk.StringVar()
         self.messageTreeLock = tk.BooleanVar()
         self.hideHeartbeats = tk.BooleanVar(master=self.root, value=True)
@@ -2085,35 +2222,40 @@ class Application(tk.Frame):
         self.messageTree_checkbox.grid(row=2,column=0, sticky=tk.E)
         
         # Set the treeview for the raw transaction table
-        self.messageTree = ttk.Treeview(self.root, columns=('Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload', 'Data', 'Description'))
+        self.messageTree = ttk.Treeview(
+            self.root,
+            columns=("Time", "Hdr", "Prio", "Mode", "Type", "TA", "SA", "Payload", "Data", "Description"),
+        )
         self.messageTreeScroll = ttk.Scrollbar(self.root)
         self.messageTreeScroll.configure(command=self.messageTree.yview)
         self.messageTree.configure(yscrollcommand=self.messageTreeScroll.set)
         
         # Set the heading (Attribute Names)
-        self.messageTree.heading('#0', text='MID')
-        self.messageTree.heading('#1', text='Hdr')
-        self.messageTree.heading('#2', text='Priority')
-        self.messageTree.heading('#3', text='Mode')
-        self.messageTree.heading('#4', text='Type')
-        self.messageTree.heading('#5', text='TA')
-        self.messageTree.heading('#6', text='SA')
-        self.messageTree.heading('#7', text='Payload')
-        self.messageTree.heading('#8', text='Data')
-        self.messageTree.heading('#9', text='Description')
+        self.messageTree.heading("#0", text="MID")
+        self.messageTree.heading("#1", text="Time (s)")
+        self.messageTree.heading("#2", text="Hdr")
+        self.messageTree.heading("#3", text="Priority")
+        self.messageTree.heading("#4", text="Mode")
+        self.messageTree.heading("#5", text="Type")
+        self.messageTree.heading("#6", text="TA")
+        self.messageTree.heading("#7", text="SA")
+        self.messageTree.heading("#8", text="Payload")
+        self.messageTree.heading("#9", text="Data")
+        self.messageTree.heading("#10", text="Description")
         
  
         # Specify attributes of the columns (We want to stretch it!)
-        self.messageTree.column('#0', minwidth=30, width=40, stretch=tk.YES)
-        self.messageTree.column('#1', minwidth=30, width=30, stretch=tk.YES)
-        self.messageTree.column('#2', minwidth=40, width=40, stretch=tk.YES)
-        self.messageTree.column('#3', minwidth=30, width=30, stretch=tk.YES)
-        self.messageTree.column('#4', minwidth=30, width=60, stretch=tk.YES)
-        self.messageTree.column('#5', minwidth=30, width=170, stretch=tk.YES)
-        self.messageTree.column('#6', minwidth=30, width=80, stretch=tk.YES)
-        self.messageTree.column('#7', minwidth=50, width=200, stretch=tk.YES)
-        self.messageTree.column('#8', minwidth=50, width=100, stretch=tk.YES)
-        self.messageTree.column('#9', minwidth=50, width=300, stretch=tk.YES)
+        self.messageTree.column("#0", minwidth=30, width=40, stretch=tk.YES)
+        self.messageTree.column("#1", minwidth=52, width=64, stretch=tk.NO)
+        self.messageTree.column("#2", minwidth=30, width=30, stretch=tk.YES)
+        self.messageTree.column("#3", minwidth=40, width=40, stretch=tk.YES)
+        self.messageTree.column("#4", minwidth=30, width=30, stretch=tk.YES)
+        self.messageTree.column("#5", minwidth=30, width=60, stretch=tk.YES)
+        self.messageTree.column("#6", minwidth=30, width=170, stretch=tk.YES)
+        self.messageTree.column("#7", minwidth=30, width=80, stretch=tk.YES)
+        self.messageTree.column("#8", minwidth=50, width=200, stretch=tk.YES)
+        self.messageTree.column("#9", minwidth=50, width=100, stretch=tk.YES)
+        self.messageTree.column("#10", minwidth=50, width=300, stretch=tk.YES)
  
         self.messageTree.grid(row=3, column=0, sticky='nsew')
         self.messageTreeScroll.grid(row=3, column=1, sticky='nsw')
@@ -2143,7 +2285,7 @@ class Application(tk.Frame):
         self.config_label.grid(row=0, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
         config_sep.grid(row=1, columnspan = 3, sticky='ew')
-        self.serial_label = tk.Label(self.config_frame, text="OBD Device Serial Port")
+        self.serial_label = tk.Label(self.config_frame, text="OBD Dev Path/Log File")
         self.serial_port_entry = tk.Entry(self.config_frame)
         self.serial_browse_button = tk.Button(self.config_frame, text="Browse", command=self.browse_file)
         self.serial_label.grid(row=2, column=0, sticky=tk.W)
@@ -2274,9 +2416,27 @@ class Application(tk.Frame):
         
     
         
-        ''' Status Bar '''
-        self.statusBar = tk.Label(self.root, textvariable=self.statusBarString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.statusBar.grid(row=4, column=0, columnspan=5, sticky='nsew')
+        ''' Status Bar (message count + optional live stats in separate labels so rates do not shift the count) '''
+        self.status_bar_frame = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
+        self.status_bar_frame.grid(row=4, column=0, columnspan=5, sticky="nsew")
+        self.status_bar_frame.columnconfigure(1, weight=1)
+        self.statusBar = tk.Label(
+            self.status_bar_frame,
+            textvariable=self.statusBarString,
+            anchor=tk.W,
+            padx=4,
+            pady=1,
+        )
+        self.statusBar.grid(row=0, column=0, sticky="nw")
+        self.statusBarRxStats = tk.Label(
+            self.status_bar_frame,
+            textvariable=self.statusBarRxStatsString,
+            anchor=tk.W,
+            padx=4,
+            pady=1,
+            fg="#333333",
+        )
+        self.statusBarRxStats.grid(row=0, column=1, sticky="nw", padx=(12, 4))
         self.statusBarOBD = tk.Label(self.root, textvariable=self.statusBarOBDString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
         self.statusBarOBD.grid(row=4, column=2, columnspan=5, sticky='nsew')
         
@@ -2285,23 +2445,69 @@ class Application(tk.Frame):
         self.sid = 0
         self.mid = 0
         self.statusBarString.set("Messages: 0")
+        self.statusBarRxStatsString.set("")
         self.statusBarOBDString.set("OBD: Disconnected")
  
  
-    def update_status_bar(self, messages=0, connected=False):
-        string = "Messages: " + str(messages)
-            
-        self.statusBarString.set(string)
+    def record_serial_rx_sample(self, bus_byte_count):
+        """Track live serial VPW frames for rolling bus throughput (VPW bytes, not ASCII wire bytes)."""
+        if not self.tool_manager.is_connected:
+            return
+        obd = self.tool_manager.obd
+        if obd is None or not obd.serial:
+            return
+        now = time.perf_counter()
+        self._serial_rx_window.append((now, int(bus_byte_count)))
+        self._trim_serial_rx_window(now)
+
+    def _trim_serial_rx_window(self, now=None):
+        now = now if now is not None else time.perf_counter()
+        cutoff = now - 3.0
+        while self._serial_rx_window and self._serial_rx_window[0][0] < cutoff:
+            self._serial_rx_window.popleft()
+
+    def _serial_rx_stats_fragment(self):
+        """Rolling ~3 s average msg/s and raw VPW bus kbps (kilobits/s); empty when not on serial."""
+        obd = getattr(self.tool_manager, "obd", None)
+        if not self.tool_manager.is_connected or obd is None or not obd.serial:
+            return ""
+        now = time.perf_counter()
+        self._trim_serial_rx_window(now)
+        if not self._serial_rx_window:
+            return "0.0 msg/s, 0.00 kbps (bus)"
+        oldest = self._serial_rx_window[0][0]
+        # Average over actual span in the window (≤3 s), with a small floor to avoid spikes when
+        # several frames share the same perf_counter sample.
+        span = min(max(now - oldest, 0.05), 3.0)
+        n = len(self._serial_rx_window)
+        nbytes = sum(b for _, b in self._serial_rx_window)
+        msg_per_sec = n / span
+        kbps = (nbytes * 8.0) / (span * 1000.0)
+        return f"{msg_per_sec:.1f} msg/s, {kbps:.2f} kbps (bus)"
+
+    def update_status_bar(self, messages=None, connected=False):
+        if messages is None:
+            mm = getattr(self, "mm", None)
+            messages = len(mm.messageHistory) if mm else 0
+        self.statusBarString.set("Messages: " + str(messages))
+        self.statusBarRxStatsString.set(self._serial_rx_stats_fragment())
 
     def update_message_count(self, messages=0):
         self.messages_receieved = messages
         
 
-    def update_obd_status(self,connected=False,dev_version=""):
+    def update_obd_status(self, connected=False, dev_version=""):
+        # ToolManager invokes this from the reader thread on connect; Tk is main-thread only.
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda c=connected, d=dev_version: self.update_obd_status(c, d))
+            return
+        if not connected:
+            self._serial_rx_window.clear()
         if connected:
             self.statusBarOBDString.set("OBD: Connected - " + str(dev_version))
         else:
             self.statusBarOBDString.set(str("OBD: Disconnected"))
+        self.update_status_bar()
     
     def browse_file(self):
         """Open file dialog to select a VPW log file"""
@@ -2321,29 +2527,104 @@ class Application(tk.Frame):
         rawString = self.idnumber_entry.get()
         self.mm.new_message(rawString)
         
+    def _history_has_any_timestamps(self):
+        mm = getattr(self, "mm", None)
+        if mm is None:
+            return False
+        for row in mm.messageHistory:
+            if len(row) > 11 and row[11] is not None:
+                return True
+        return False
+
     def export_log(self):
-        """Export logs to a user-selected file"""
-        file_path = filedialog.asksaveasfilename(
-            title="Export VPW Logs",
-            defaultextension=".txt",
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("Log files", "*.log"),
-                ("All files", "*.*")
-            ],
-            initialfile="export.txt"
+        """Export logs: path + optional line-leading timestamps (dialog)."""
+        if not self.mm.messageHistory:
+            messagebox.showinfo("Export", "No messages to export.", parent=self.root)
+            return
+        has_ts = self._history_has_any_timestamps()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Export VPW Logs")
+        dlg.transient(self.root)
+        dlg.resizable(True, False)
+
+        path_var = tk.StringVar(value="export.txt")
+        include_ts = tk.BooleanVar(value=has_ts)
+
+        outer = ttk.Frame(dlg, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(outer, text="File:").grid(row=0, column=0, sticky=tk.W)
+        ent = ttk.Entry(outer, textvariable=path_var, width=52)
+        ent.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 6))
+
+        def browse():
+            p = filedialog.asksaveasfilename(
+                parent=dlg,
+                title="Export VPW Logs",
+                defaultextension=".txt",
+                filetypes=[
+                    ("Text files", "*.txt"),
+                    ("Log files", "*.log"),
+                    ("All files", "*.*"),
+                ],
+                initialfile=path_var.get().strip() or "export.txt",
+            )
+            if p:
+                path_var.set(p)
+
+        ttk.Button(outer, text="Browse…", command=browse).grid(row=1, column=2, padx=(6, 0), pady=(2, 6))
+
+        chk = ttk.Checkbutton(
+            outer,
+            text="Include relative timestamps (0.000 s) at the start of each line",
+            variable=include_ts,
         )
-        
-        if file_path:
+        chk.grid(row=2, column=0, columnspan=3, sticky=tk.W)
+        if not has_ts:
+            include_ts.set(False)
+            chk.state(["disabled"])
+
+        err_lbl = ttk.Label(outer, text="", foreground="#a00")
+        err_lbl.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=4, column=0, columnspan=3, pady=(10, 0))
+
+        def do_export():
+            file_path = path_var.get().strip()
+            if not file_path:
+                err_lbl.config(text="Choose a file path.")
+                return
+            want_ts = bool(include_ts.get()) and has_ts
             try:
                 with open(file_path, "w", encoding="utf-8", newline="") as fexport:
-                    for line in self.mm.messageHistory:
-                        # Always original raw hex line from capture (never ASCII-mixed view).
-                        fexport.write(line[8] + "\r\n")
+                    for row in self.mm.messageHistory:
+                        raw = row[8]
+                        ts = row[11] if len(row) > 11 else None
+                        if want_ts and ts is not None:
+                            fexport.write(_format_vpw_export_timestamp(ts) + " " + raw + "\r\n")
+                        else:
+                            fexport.write(raw + "\r\n")
                 print(f"Logs exported successfully to: {file_path}")
+                dlg.destroy()
             except Exception as e:
-                print(f"Error exporting logs: {e}")
-                messagebox.showerror("Export Error", f"Failed to export logs:\n{e}")
+                err_lbl.config(text=str(e))
+
+        ttk.Button(btn_row, text="Export", command=do_export).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT)
+
+        outer.columnconfigure(0, weight=1)
+        dlg.grab_set()
+        ent.focus_set()
+
+    def _current_recv_timestamp_for_transmit_echo(self):
+        obd = getattr(self.tool_manager, "obd", None)
+        if obd is None or not obd.serial:
+            return None
+        t0 = getattr(obd, "_vpw_capture_t0", None)
+        if t0 is None:
+            return None
+        return time.perf_counter() - t0
         
 
     def new_message(self, newMsg, tags=()):
@@ -2392,7 +2673,10 @@ class Application(tk.Frame):
     def _message_history_tree_values_tuple(self, hist_row):
         try_ascii = self.decodeAsciiPayloadView.get()
         pl = _vpw_payload_column_text(hist_row[7], try_ascii)
+        ts = hist_row[11] if len(hist_row) > 11 else None
+        ts_txt = _format_vpw_export_timestamp(ts) if ts is not None else ""
         return (
+            ts_txt,
             "{:02X}".format(hist_row[1]),
             hist_row[4],
             hist_row[5],
@@ -2452,10 +2736,15 @@ class Application(tk.Frame):
         self._last_send_selection = None
             
         self.mm = MessageManager(self)
-            
+        self._serial_rx_window.clear()
+        obd = getattr(self.tool_manager, "obd", None)
+        if self.tool_manager.is_connected and obd is not None:
+            obd.reset_vpw_capture_epoch()
+
         self.mid = 0
         self.sid = 0
-        
+        self.update_status_bar(0)
+
     def read_file(self):
         file_path = self.serial_port_entry.get()
         # Use ToolManager to handle connection
@@ -2505,7 +2794,12 @@ class Application(tk.Frame):
         if not self.showTransmittedFrames.get():
             return
         line = f"{hdr} {pl}".strip()
-        self.mm.new_message(line, skip_summary=True, transmit_echo=True)
+        self.mm.new_message(
+            line,
+            skip_summary=True,
+            transmit_echo=True,
+            recv_rel_sec=self._current_recv_timestamp_for_transmit_echo(),
+        )
 
     def on_transmit_send(self):
         """Send Header + Payload using DVI (OBDX) or ELM/STN path."""
@@ -2580,11 +2874,22 @@ class Application(tk.Frame):
         # Process any messages in the queue
         try:
             while True:
-                line = self.queue.get_nowait()
-                self.mm.new_message(line)
+                item = self.queue.get_nowait()
+                if isinstance(item, tuple) and len(item) == 3:
+                    line, recv_ts, live_serial = item
+                elif isinstance(item, tuple) and len(item) == 2:
+                    line, recv_ts = item
+                    live_serial = False
+                else:
+                    line, recv_ts, live_serial = item, None, False
+                self.mm.new_message(line, recv_rel_sec=recv_ts, live_serial_rx=live_serial)
         except queue.Empty:
             pass
-        
+
+        # Always refresh from the UI thread so stats reappear after reconnect (Tk StringVars are not
+        # safe to update from the reader thread; see update_obd_status).
+        self.update_status_bar()
+
         # Schedule the next update
         self.root.after(100, self.update_ui)
     
@@ -2620,10 +2925,10 @@ class Application(tk.Frame):
                 raw_pl = self.mm.messageSummary[idx][9]
                 hdr, ta, sa = vals[2], vals[6], vals[7]
             else:
-                if idx < 0 or idx >= len(self.mm.messageHistory) or len(vals) < 8:
+                if idx < 0 or idx >= len(self.mm.messageHistory) or len(vals) < 7:
                     return None
                 raw_pl = self.mm.messageHistory[idx][7]
-                hdr, ta, sa = vals[0], vals[4], vals[5]
+                hdr, ta, sa = vals[1], vals[5], vals[6]
         except (IndexError, TypeError):
             return None
         try:

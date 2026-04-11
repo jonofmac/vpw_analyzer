@@ -518,8 +518,8 @@ def description_from_tree_values(values, is_summary):
         return ""
     if is_summary and len(values) > 10:
         return str(values[10])
-    if not is_summary and len(values) > 8:
-        return str(values[8])
+    if not is_summary and len(values) > 9:
+        return str(values[9])
     return ""
 
 
