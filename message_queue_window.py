@@ -486,7 +486,7 @@ class MessageQueueWindow:
             messagebox.showinfo("Send", "Select a queue first.", parent=self.win)
             return
         if not self.app.tool_manager.is_connected:
-            messagebox.showwarning("Not connected", "Open a serial device with Read first.", parent=self.win)
+            messagebox.showwarning("Not connected", "Open a serial device with Read/Open first.", parent=self.win)
             return
         if not self.app.tool_manager.obd or not self.app.tool_manager.obd.serial:
             messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection.", parent=self.win)

@@ -7,8 +7,8 @@ Description: This is a utility that parses incoming messages from a VPW interfac
     into a more human-readable format. The bottom box shows each message that was
     received in order. The top box shows unique messages that were received.
     It connects to an ELM327 like device via a serial port. If on Windows, type
-    the COM port number into the 'OBD Device Port' and press 'Read'. If on Unix
-    based system, type in the full path (/dev/serialTTY) and press 'Read'.
+    the COM port number into the 'OBD Device Port' and press 'Read/Open'. If on Unix
+    based system, type in the full path (/dev/serialTTY) and press 'Read/Open'.
 
 Changes
     - TBD
@@ -38,6 +38,7 @@ import threading
 import time
 import serial
 import re
+import string
 
 
 # Short read timeout while probing ELM prompts (adapter stuck in DVI won't send '>')
@@ -64,13 +65,98 @@ def _dvi_reboot_to_boot_frame():
     return bytes([0x25, 0x00, _dvi_checksum([0x25, 0x00])])
 
 
+def _vpw_crc8_sae_j1850(body: bytes) -> int:
+    """
+    One-byte VPW frame CRC (CRC-8/SAE-J1850 style: poly 0x1D, init 0xFF, xorout 0xFF, MSB-first).
+    ``body`` is the full frame without the CRC byte (header + payload).
+    """
+    crc = 0xFF
+    for b in body:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x1D) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+
+def _vpw_frame_append_crc_if_missing(frame: bytes) -> bytes:
+    """
+    If the last byte is already a valid VPW CRC for the preceding bytes, return ``frame`` unchanged.
+    Otherwise append the CRC for the whole frame (OBDX DVI passive RX / older exports omit bus CRC).
+    """
+    frame = bytes(frame)
+    if len(frame) < 3:
+        return frame
+    if len(frame) >= 4 and _vpw_crc8_sae_j1850(frame[:-1]) == frame[-1]:
+        return frame
+    return frame + bytes([_vpw_crc8_sae_j1850(frame)])
+
+
+def _vpw_hex_line_append_crc_if_missing(hex_line: str) -> str:
+    """Normalize a VPW hex text line so it includes a trailing CRC when absent (log import / Parse)."""
+    s = hex_line.strip()
+    if not s or not VPW_frame.is_valid(s):
+        return hex_line
+    try:
+        raw = bytes.fromhex(s.replace(" ", ""))
+    except ValueError:
+        return hex_line
+    if len(raw) < 3:
+        return hex_line
+    fixed = _vpw_frame_append_crc_if_missing(raw)
+    if fixed == raw:
+        return hex_line
+    return " ".join(f"{b:02X}" for b in fixed)
+
+
+# Bytes shown as characters in "try decode ASCII" payload view (letters, digits, punctuation, space).
+_ASCII_PAYLOAD_VIEW_BYTES = frozenset(
+    (string.ascii_letters + string.digits + string.punctuation + " ").encode("latin-1")
+)
+
+
+def _vpw_payload_body_bytes(payload_bytes):
+    """Payload bytes shown in the Payload column (strip trailing CRC when multi-byte)."""
+    if not payload_bytes:
+        return b""
+    pb = bytes(payload_bytes)
+    if len(pb) == 1:
+        return pb
+    return pb[:-1]
+
+
 def _vpw_payload_hex_for_display(payload_bytes):
     """Format payload for Treeview; strip trailing CRC when present (ELM). DVI often has no CRC."""
-    if not payload_bytes:
+    body = _vpw_payload_body_bytes(payload_bytes)
+    if not body:
         return ""
-    if len(payload_bytes) == 1:
-        return "{:02X}".format(payload_bytes[0])
-    return " ".join("{:02X}".format(x) for x in payload_bytes[:-1])
+    return " ".join("{:02X}".format(x) for x in body)
+
+
+def _vpw_payload_hex_with_ascii_bracket(payload_bytes):
+    """Space-separated hex plus a bracketed ASCII run (~ for non-printable-set bytes)."""
+    hx = _vpw_payload_hex_for_display(payload_bytes)
+    body = _vpw_payload_body_bytes(payload_bytes)
+    if not body:
+        return hx
+    chars = []
+    for b in body:
+        chars.append(chr(b) if b in _ASCII_PAYLOAD_VIEW_BYTES else "~")
+    bracket = "[" + "".join(chars) + "]"
+    return f"{hx} {bracket}" if hx else bracket
+
+
+def _vpw_payload_column_text(payload_bytes, try_ascii):
+    if try_ascii:
+        return _vpw_payload_hex_with_ascii_bracket(payload_bytes)
+    return _vpw_payload_hex_for_display(payload_bytes)
+
+
+def _vpw_payload_hex_for_transmit(payload_bytes):
+    """Space-separated hex for transmit / queue (same body as Payload column, never ASCII)."""
+    return _vpw_payload_hex_for_display(payload_bytes)
 
 
 # Help text for the application
@@ -87,12 +173,12 @@ OBD Device Serial Port Field:
 • For file analysis: Enter the full path to a VPW log file
   - Example: /home/user/vpw_log.txt
   - Example: C:\\Users\\User\\Documents\\vpw_log.txt
-• Click "Read" to open the port/file and start parsing
-• From a terminal you can run: python vpw_analyzer.py <path> — the path is filled in and Read runs automatically
+• Click "Read/Open" to open the port or log file and start parsing; use "Close port" to stop the reader thread and close the serial device cleanly
+• From a terminal you can run: python vpw_analyzer.py <path> — the path is filled in and Read/Open runs automatically
 
 Raw Line Input:
 • Manually enter VPW messages for parsing
-• Format: 3-byte header + data + checksum/CRC
+• Format: 3-byte header + data + checksum/CRC (if the CRC byte is missing—common with OBDX DVI exports—the program adds SAE J1850 CRC-8 before parsing, same as live DVI capture)
 • Example: 8C F1 10 11 80 24 5A
 • Click "Parse" to process the message
 
@@ -106,7 +192,8 @@ Tips & Tricks:
 • Click once on a row in Summary or Message history to mark it (highlight) for "Send Selected Message"; double-click still fills the transmit fields only
 • With focus in Summary or Message history, Space triggers Send Selected Message (same as the button)
 • Right-click a row in Summary or Message history: Add to queue (new queue or append to an existing one). Open Message queues from the transmit panel to reorder messages, double-click Header/Payload/Description to edit (Enter saves, Esc cancels), Export/Import JSON, or send an entire queue in order; use Load into transmit to copy the selected row to the transmit fields
-• Enable "Show transmitted frames in message history" to append each successful send as a green-tagged row with a [TX] description prefix
+• "Show transmitted frames in message history" is on by default; turn it off if you do not want each successful send appended as a green-tagged row with a [TX] description prefix
+• "Try to decode ASCII in payload column" (under View Settings) keeps the normal space-separated hex and appends a bracketed run (e.g. [A~b]) with one character per byte for letters, digits, punctuation, and space, or ~ otherwise; transmit, Send Selected, and Add to queue still use raw hex from the stored frame only. Export logs always writes the original raw hex lines only
 
 VPW Protocol Primer
 ===================
@@ -438,8 +525,12 @@ class OBD():
     def __del__ (self):
         self.close()
 
-    def _vpw_bytes_to_hex_line(self, body):
-        return " ".join(f"{b:02X}" for b in body)
+    def _vpw_bytes_to_hex_line(self, body, append_vpw_crc=False):
+        """Format raw VPW frame bytes as hex. If ``append_vpw_crc``, add SAE J1850 CRC when DVI omitted it."""
+        b = bytes(body)
+        if append_vpw_crc:
+            b = _vpw_frame_append_crc_if_missing(b)
+        return " ".join(f"{b:02X}" for b in b)
 
     def _dvi_try_pop_frame(self):
         """If a complete valid DVI frame is at the front of the buffer, consume and return (cmd, payload)."""
@@ -510,7 +601,7 @@ class OBD():
                 if rcmd == 0x7F:
                     raise Exception(f"OBDX DVI fault: {payload.hex()}")
                 if rcmd in (0x08, 0x09):
-                    self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload))
+                    self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True))
                     continue
                 if rcmd == cmd + 0x10:
                     return payload
@@ -700,7 +791,7 @@ class OBD():
                                 print("OBDX DVI bus fault:", payload.hex())
                                 continue
                             if rcmd in (0x08, 0x09):
-                                return self._vpw_bytes_to_hex_line(payload) + "\n"
+                                return self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True) + "\n"
                             if rcmd in (0x20, 0x21):
                                 continue
                             print("OBDX DVI unsolicited frame cmd=%02X: %s" % (rcmd, payload.hex()))
@@ -773,7 +864,7 @@ class OBD():
                         break
                     rcmd, body = popped
                     if rcmd in (0x08, 0x09):
-                        self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(body))
+                        self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(body, append_vpw_crc=True))
                         continue
                     if rcmd == 0x7F:
                         print("OBDX DVI send fault:", body.hex())
@@ -1293,8 +1384,7 @@ class VPW_frame:
             print ("Issue processing: ", byteString)
             return None
             
-        # OBDX DVI (and similar) often omits the trailing VPW CRC on passive RX, so frames
-        # are 4 bytes (Hdr, TA, SA, one data) instead of 5 with CRC — especially heartbeats.
+        # OBDX DVI passive RX may omit the trailing VPW CRC; the UI layer appends SAE J1850 CRC-8 when missing so frames match ELM-style captures.
         if len(byteArray) < 4:
             return None
 
@@ -1518,8 +1608,8 @@ class MessageManager():
         self.hide_heartbeat = False
         
     def new_message(self, input_string, skip_summary=False, transmit_echo=False):
-        # Send string off to get parsed
-        inString = input_string.rstrip()
+        # Send string off to get parsed (add VPW CRC when missing so payload display matches ELM / bus)
+        inString = _vpw_hex_line_append_crc_if_missing(input_string.rstrip())
         newMsg = VPW_frame.process(inString)
         
         # If object is NoneType, then it failed to parse. Potentially invalid packet
@@ -1906,7 +1996,7 @@ class Application(tk.Frame):
             self.root.after_idle(self._apply_initial_open)
 
     def _apply_initial_open(self):
-        """CLI: pre-fill OBD Device field and run Read (serial port or log file path)."""
+        """CLI: pre-fill OBD Device field and run Read/Open (serial port or log file path)."""
         self.serial_port_entry.delete(0, tk.END)
         self.serial_port_entry.insert(0, self._initial_open)
         self.read_file()
@@ -1931,7 +2021,8 @@ class Application(tk.Frame):
         self.messageTreeLock = tk.BooleanVar()
         self.hideHeartbeats = tk.BooleanVar(master=self.root, value=True)
         self.hideHeartbeatsEverywhere = tk.BooleanVar(master=self.root, value=True)
-        self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=False)
+        self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=True)
+        self.decodeAsciiPayloadView = tk.BooleanVar(master=self.root, value=False)
         self.messageUniqueByte = tk.StringVar()
         self.messageUniqueByte.set("2")
         
@@ -2073,13 +2164,15 @@ class Application(tk.Frame):
         self.idnumber_entry.bind('<Control-A>', self.select_all_text)
  
  
+        self.close_port_button = tk.Button(self.config_frame, text="Close port", command=self.close_serial_connection)
+        self.close_port_button.grid(row=4, column=0, sticky=tk.W)
         self.submit_button = tk.Button(self.config_frame, text="Parse", command=self.insert_data)
         self.submit_button.grid(row=4, column=1, sticky=tk.W)
-        self.read_button = tk.Button(self.config_frame, text="Read", command=self.read_file)
+        self.read_button = tk.Button(self.config_frame, text="Read/Open", command=self.read_file)
         self.read_button.grid(row=4, column=2, sticky=tk.W)
  
  
-        # View settings (own rows so they do not overlap Parse/Read)
+        # View settings (own rows so they do not overlap Parse / Read/Open)
         self.view_settings_label = tk.Label(self.config_frame, text="View Settings")
         self.view_settings_label.grid(row=5, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
@@ -2094,7 +2187,17 @@ class Application(tk.Frame):
         self.view_uniqueByte_label.grid(row=9, column=0, sticky=tk.W)
         self.view_uniqueByte = tk.OptionMenu(self.config_frame, self.messageUniqueByte, "0", "1", "2", "All")
         self.view_uniqueByte.grid(row=9, column=1, sticky=tk.W)
-        
+
+        self.view_decode_ascii_payload = tk.Checkbutton(
+            self.config_frame,
+            text="Try to decode ASCII in payload column",
+            variable=self.decodeAsciiPayloadView,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.view_decode_ascii_payload.grid(row=10, column=0, columnspan=3, sticky=tk.W)
+        self.decodeAsciiPayloadView.trace_add("write", lambda *_: self._refresh_payload_column_display())
+
         self.delete_button = tk.Button(self.config_frame, text="Clear Message Logs", command=self.delete_data)
         self.delete_button.grid(row=100, column=0, sticky=tk.W)
         
@@ -2233,9 +2336,10 @@ class Application(tk.Frame):
         
         if file_path:
             try:
-                with open(file_path, "w") as fexport:
+                with open(file_path, "w", encoding="utf-8", newline="") as fexport:
                     for line in self.mm.messageHistory:
-                        fexport.write(line[8] + "\r\n")  # line[8] is the raw hex data stream (inString)
+                        # Always original raw hex line from capture (never ASCII-mixed view).
+                        fexport.write(line[8] + "\r\n")
                 print(f"Logs exported successfully to: {file_path}")
             except Exception as e:
                 print(f"Error exporting logs: {e}")
@@ -2249,17 +2353,7 @@ class Application(tk.Frame):
             "end",
             iid=newMsg[0],
             text=str(newMsg[0]),
-            values=(
-                "{:02X}".format(newMsg[1]),
-                newMsg[4],
-                newMsg[5],
-                newMsg[6],
-                newMsg[2],
-                newMsg[3],
-                _vpw_payload_hex_for_display(newMsg[7]),
-                newMsg[9],
-                newMsg[10],
-            ),
+            values=self._message_history_tree_values_tuple(newMsg),
             tags=tags,
         )
 
@@ -2273,22 +2367,79 @@ class Application(tk.Frame):
         
     def new_message_summary(self, newMsg):        
         # Print the message to the message history tree
-        self.summaryTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
-                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
-                             newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
+        self.summaryTree.insert(
+            "",
+            "end",
+            iid=newMsg[0],
+            text=str(newMsg[0]),
+            values=self._summary_tree_values_tuple(newMsg),
+        )
         #self.sid = self.sid + 1
         
         
     def update_message_summary(self, index, newMsg):
         try:
-            self.summaryTree.item(index, text=str(index),
-                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
+            self.summaryTree.item(
+                index,
+                text=str(index),
+                values=self._summary_tree_values_tuple(newMsg),
+            )
         except ValueError:
             print ("Issue updating index, ", newMsg)
             for child in self.summaryTree.get_children():
                 print(self.summaryTree.item(child)["values"])
-    
-    
+
+    def _message_history_tree_values_tuple(self, hist_row):
+        try_ascii = self.decodeAsciiPayloadView.get()
+        pl = _vpw_payload_column_text(hist_row[7], try_ascii)
+        return (
+            "{:02X}".format(hist_row[1]),
+            hist_row[4],
+            hist_row[5],
+            hist_row[6],
+            hist_row[2],
+            hist_row[3],
+            pl,
+            hist_row[9],
+            hist_row[10],
+        )
+
+    def _summary_tree_values_tuple(self, sum_row):
+        try_ascii = self.decodeAsciiPayloadView.get()
+        pl = _vpw_payload_column_text(sum_row[9], try_ascii)
+        return (
+            sum_row[2],
+            sum_row[1],
+            "{:02X}".format(sum_row[3]),
+            sum_row[6],
+            sum_row[7],
+            sum_row[8],
+            sum_row[4],
+            sum_row[5],
+            pl,
+            sum_row[10],
+            sum_row[11],
+        )
+
+    def _refresh_payload_column_display(self):
+        mm = getattr(self, "mm", None)
+        if mm is None:
+            return
+        try:
+            for iid in self.messageTree.get_children():
+                idx = int(iid)
+                row = mm.messageHistory[idx]
+                self.messageTree.item(iid, values=self._message_history_tree_values_tuple(row))
+        except (ValueError, IndexError, tk.TclError):
+            pass
+        try:
+            for iid in self.summaryTree.get_children():
+                idx = int(iid)
+                row = mm.messageSummary[idx]
+                self.summaryTree.item(iid, values=self._summary_tree_values_tuple(row))
+        except (ValueError, IndexError, tk.TclError):
+            pass
+
     def delete_data(self):
         #row_id = int(self.summaryTree.focus())
         #self.summaryTreeview.delete(row_id)
@@ -2309,6 +2460,10 @@ class Application(tk.Frame):
         file_path = self.serial_port_entry.get()
         # Use ToolManager to handle connection
         self.tool_manager.connect(file_path)
+
+    def close_serial_connection(self):
+        """Stop the reading thread and close the serial port (or file handle) cleanly."""
+        self.tool_manager.disconnect()
 
     def _clear_last_send_row_highlight(self):
         if not self._last_send_selection:
@@ -2355,7 +2510,7 @@ class Application(tk.Frame):
     def on_transmit_send(self):
         """Send Header + Payload using DVI (OBDX) or ELM/STN path."""
         if not self.tool_manager.is_connected:
-            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            messagebox.showwarning("Not connected", "Open a serial device with Read/Open first.")
             return
         if not self.tool_manager.obd or not self.tool_manager.obd.serial:
             messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
@@ -2381,7 +2536,7 @@ class Application(tk.Frame):
     def on_transmit_send_selected(self):
         """Send the last single-clicked row from Summary or Message history (see highlight)."""
         if not self.tool_manager.is_connected:
-            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            messagebox.showwarning("Not connected", "Open a serial device with Read/Open first.")
             return
         if not self.tool_manager.obd or not self.tool_manager.obd.serial:
             messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
@@ -2394,13 +2549,12 @@ class Application(tk.Frame):
             return
         tree, iid = self._last_send_selection
         try:
-            vals = tree.item(iid, "values")
+            tree.item(iid, "values")
         except tk.TclError:
             self._last_send_selection = None
             messagebox.showwarning("Send target", "That row no longer exists. Click another message.")
             return
-        is_summary = tree is self.summaryTree
-        pair = self._header_payload_from_values(vals, is_summary)
+        pair = self._header_payload_from_tree(tree, iid)
         if not pair:
             messagebox.showerror("Send target", "Could not build a frame from the selected row.")
             return
@@ -2443,41 +2597,51 @@ class Application(tk.Frame):
         """Handle double-click on summary tree to populate transmit frame"""
         item = self.summaryTree.selection()[0] if self.summaryTree.selection() else None
         if item:
-            values = self.summaryTree.item(item, 'values')
-            self.populate_transmit_frame(values, is_summary=True)
+            self.populate_transmit_frame(self.summaryTree, item)
     
     def on_message_double_click(self, event):
         """Handle double-click on message tree to populate transmit frame"""
         item = self.messageTree.selection()[0] if self.messageTree.selection() else None
         if item:
-            values = self.messageTree.item(item, 'values')
-            self.populate_transmit_frame(values, is_summary=False)
-    
-    def _header_payload_from_values(self, values, is_summary):
-        """Build transmit header + payload hex strings from a tree row's column values."""
+            self.populate_transmit_frame(self.messageTree, item)
+
+    def _header_payload_from_tree(self, tree, iid):
+        """Build transmit header + payload hex from tree row (payload always from stored bytes)."""
+        is_summary = tree is self.summaryTree
+        try:
+            vals = tree.item(iid, "values")
+            idx = int(iid)
+        except (tk.TclError, ValueError, TypeError):
+            return None
         try:
             if is_summary:
-                if len(values) < 10:
+                if idx < 0 or idx >= len(self.mm.messageSummary) or len(vals) < 10:
                     return None
-                hdr, ta, sa, payload = values[2], values[6], values[7], values[8]
+                raw_pl = self.mm.messageSummary[idx][9]
+                hdr, ta, sa = vals[2], vals[6], vals[7]
             else:
-                if len(values) < 8:
+                if idx < 0 or idx >= len(self.mm.messageHistory) or len(vals) < 8:
                     return None
-                hdr, ta, sa, payload = values[0], values[4], values[5], values[6]
+                raw_pl = self.mm.messageHistory[idx][7]
+                hdr, ta, sa = vals[0], vals[4], vals[5]
+        except (IndexError, TypeError):
+            return None
+        try:
             ta_hex = self.extract_hex_from_column(ta)
             sa_hex = self.extract_hex_from_column(sa)
             if ta_hex and sa_hex:
                 header = f"{hdr} {ta_hex} {sa_hex}"
             else:
                 header = str(hdr)
-            return (header.strip(), str(payload).strip())
-        except (IndexError, TypeError, ValueError):
+            pl = _vpw_payload_hex_for_transmit(raw_pl)
+            return (header.strip(), pl.strip())
+        except (TypeError, ValueError):
             return None
 
-    def populate_transmit_frame(self, values, is_summary=False):
+    def populate_transmit_frame(self, tree, item):
         """Populate transmit frame fields with data from selected row"""
         try:
-            pair = self._header_payload_from_values(values, is_summary)
+            pair = self._header_payload_from_tree(tree, item)
             if not pair:
                 print("Error: Not enough columns or bad data in tree row")
                 return
@@ -2551,7 +2715,7 @@ class Application(tk.Frame):
             vals = tree.item(row, "values")
         except tk.TclError:
             return
-        pair = self._header_payload_from_values(vals, is_summary)
+        pair = self._header_payload_from_tree(tree, row)
         if not pair:
             return
         hdr, pl = pair
