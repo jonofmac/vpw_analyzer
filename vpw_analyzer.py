@@ -26,10 +26,45 @@ import tkinter as tk
 from tkinter import messagebox, filedialog
 import tkinter.ttk as ttk
 import queue
+import sys
 import threading
 import time
 import serial
 import re
+
+
+# Short read timeout while probing ELM prompts (adapter stuck in DVI won't send '>')
+OBD_SERIAL_PROBE_TIMEOUT = 0.4
+OBD_SERIAL_RUNTIME_TIMEOUT = 3.0
+
+
+def _dvi_checksum(body_without_chk):
+    """OBDX DVI checksum: bitwise NOT of (sum of preceding bytes mod 256)."""
+    return ((~sum(body_without_chk)) & 0xFF)
+
+
+def _dvi_pack(cmd, data):
+    """Build a normal DVI frame: cmd, len(data), data..., checksum (cmd 0x08–0x11 style)."""
+    data = bytes(data)
+    if len(data) > 255:
+        raise ValueError("payload too long for normal DVI frame; use large-frame command")
+    body = bytes([cmd, len(data)]) + data
+    return body + bytes([_dvi_checksum(body)])
+
+
+def _dvi_reboot_to_boot_frame():
+    """§3.10.1 Software reboot — returns adapter to ELM default after boot."""
+    return bytes([0x25, 0x00, _dvi_checksum([0x25, 0x00])])
+
+
+def _vpw_payload_hex_for_display(payload_bytes):
+    """Format payload for Treeview; strip trailing CRC when present (ELM). DVI often has no CRC."""
+    if not payload_bytes:
+        return ""
+    if len(payload_bytes) == 1:
+        return "{:02X}".format(payload_bytes[0])
+    return " ".join("{:02X}".format(x) for x in payload_bytes[:-1])
+
 
 # Help text for the application
 HELP_TEXT = """VPW Analyzer Help
@@ -46,6 +81,7 @@ OBD Device Serial Port Field:
   - Example: /home/user/vpw_log.txt
   - Example: C:\\Users\\User\\Documents\\vpw_log.txt
 • Click "Read" to open the port/file and start parsing
+• From a terminal you can run: python vpw_analyzer.py <path> — the path is filled in and Read runs automatically
 
 Raw Line Input:
 • Manually enter VPW messages for parsing
@@ -57,8 +93,12 @@ Tips & Tricks:
 ==============
 • Double-click any message in the Summary or Message History tables to automatically populate the Transmit Frame with that message's header and payload
 • Use Ctrl+A in any text field to select all text
-• The "Hide Module Heartbeats" option filters out routine heartbeat messages
+• "Hide module heartbeats from summary table" (on by default) filters routine heartbeats out of the summary only (they still appear in message history unless the next option is on)
+• "Hide module heartbeats from everything" (on by default) also omits them from message history and export
 • Adjust "Compare First # Bytes" to control how messages are grouped in the summary table
+• Click once on a row in Summary or Message history to mark it (highlight) for "Send Selected Message"; double-click still fills the transmit fields only
+• With focus in Summary or Message history, Space triggers Send Selected Message (same as the button)
+• Enable "Show transmitted frames in message history" to append each successful send as a green-tagged row with a [TX] description prefix
 
 VPW Protocol Primer
 ===================
@@ -377,6 +417,10 @@ class OBD():
         self.dev_dxi_string = None
         self.dev_type = None
         self.dev_string = None
+        self.dvi_mode = False
+        self._dvi_rx_buffer = bytearray()
+        self._dvi_pending_lines = []
+        self._sp_lock = threading.RLock()
         
         # There is probably a better way to determine if something is a serial device or not.
         if filename.lower().startswith("com") or filename.startswith("/dev"):
@@ -385,6 +429,135 @@ class OBD():
 
     def __del__ (self):
         self.close()
+
+    def _vpw_bytes_to_hex_line(self, body):
+        return " ".join(f"{b:02X}" for b in body)
+
+    def _dvi_try_pop_frame(self):
+        """If a complete valid DVI frame is at the front of the buffer, consume and return (cmd, payload)."""
+        buf = self._dvi_rx_buffer
+        if len(buf) < 3:
+            return None
+        cmd = buf[0]
+        if cmd == 0x7F:
+            dlen = buf[1]
+            tot = 2 + dlen + 1
+            if len(buf) < tot:
+                return None
+            frame = bytes(buf[:tot])
+            del buf[:tot]
+            if frame[-1] != _dvi_checksum(frame[:-1]):
+                return None
+            return (0x7F, frame[2:-1])
+        if cmd == 0x09:
+            if len(buf) < 5:
+                return None
+            dlen = (buf[1] << 8) | buf[2]
+            tot = 1 + 2 + dlen + 1
+            if len(buf) < tot:
+                return None
+            frame = bytes(buf[:tot])
+            del buf[:tot]
+            if frame[-1] != _dvi_checksum(frame[:-1]):
+                return None
+            return (0x09, frame[3:-1])
+        if cmd == 0x08:
+            dlen = buf[1]
+            tot = 2 + dlen + 1
+            if len(buf) < tot:
+                return None
+            frame = bytes(buf[:tot])
+            del buf[:tot]
+            if frame[-1] != _dvi_checksum(frame[:-1]):
+                return None
+            return (0x08, frame[2:-1])
+        dlen = buf[1]
+        tot = 2 + dlen + 1
+        if len(buf) < tot:
+            return None
+        frame = bytes(buf[:tot])
+        del buf[:tot]
+        if frame[-1] != _dvi_checksum(frame[:-1]):
+            return None
+        return (cmd, frame[2:-1])
+
+    def _dvi_feed(self):
+        """Non-blocking read of any waiting serial bytes into the DVI buffer."""
+        n = self.sp.in_waiting
+        if n:
+            self._dvi_rx_buffer.extend(self.sp.read(n))
+
+    def _dvi_transact(self, cmd, data, timeout=3.0):
+        """Send one DVI command and wait for response cmd+0x10 (or raise on 7F / timeout)."""
+        pkt = _dvi_pack(cmd, data)
+        self.sp.write(pkt)
+        end = time.perf_counter() + timeout
+        while time.perf_counter() < end:
+            self._dvi_feed()
+            while True:
+                popped = self._dvi_try_pop_frame()
+                if popped is None:
+                    break
+                rcmd, payload = popped
+                if rcmd == 0x7F:
+                    raise Exception(f"OBDX DVI fault: {payload.hex()}")
+                if rcmd in (0x08, 0x09):
+                    self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload))
+                    continue
+                if rcmd == cmd + 0x10:
+                    return payload
+            time.sleep(0.002)
+        raise Exception("OBDX DVI command timeout")
+
+    def _open_obdx_dvi_vp_monitor(self):
+        """Switch to DVI and enable VPW passive monitoring (OBDX Pro reference manual §3)."""
+        self.sp.write(b"DX DP 1\r\n")
+        rsp = self.sp.read_until(b">")
+        if len(rsp) == 0 or b"OK" not in rsp:
+            raise Exception("OBDX did not accept DX DP 1 (switch to DVI)")
+        self.dvi_mode = True
+        self._dvi_rx_buffer.clear()
+        self._dvi_pending_lines.clear()
+        self.sp.reset_input_buffer()
+        # Timestamp off (default off; explicit), VPW protocol, network on — order per manual
+        # §3.9.3: 24 02 03 NN — NN=00 timestamp off (explicit; default is off)
+        self._dvi_transact(0x24, [0x03, 0x00])
+        # §3.11: "31 02 01 XX" = len 0x02, payload 0x01 (sub) + XX (VPW = 0x01)
+        self._dvi_transact(0x31, [0x01, 0x01])
+        # "31 02 02 XX" = len 0x02, payload 0x02 (sub) + XX (network on = 0x01)
+        self._dvi_transact(0x31, [0x02, 0x01])
+
+    def _recover_from_obdx_dvi_mode(self):
+        """
+        Prior exit in DVI leaves the tool speaking binary; ATZ is then parsed as garbage (7F...).
+        Try DVI 'change API to ELM' (manual §3.11.3), then software reboot if needed.
+        """
+        self.sp.reset_input_buffer()
+        self.sp.write(_dvi_pack(0x31, [0x06, 0x00]))
+        time.sleep(0.35)
+        self.sp.reset_input_buffer()
+        self.sp.write(b"\r")
+        r = self.sp.read_until(b">")
+        if b">" in r:
+            return
+        print("OBDX: ELM API switch not detected; sending DVI software reboot (0x25)...")
+        self.sp.reset_input_buffer()
+        self.sp.write(_dvi_reboot_to_boot_frame())
+        time.sleep(2.2)
+        self.sp.reset_input_buffer()
+        self.sp.write(b"\r")
+        self.sp.read_until(b">")
+
+    def _open_elm_vp_monitor(self):
+        self.sp.write(b'atsp2\r\n')
+        if (len(self.sp.read_until(b'>')) == 0):
+            raise Exception("Device did not accept configuration")
+        self.sp.write(b'ath1\r\n')
+        if (len(self.sp.read_until(b'>')) == 0):
+            raise Exception("Device did not accept configuration")
+        self.sp.write(b'atma\r\n')
+        if (len(self.sp.read_until(b'\r\n')) == 0):
+            raise Exception("Device did not enter atma mode")
         
     def open(self):
     
@@ -398,7 +571,7 @@ class OBD():
             if self.sp:
                 self.sp.close()
 
-            self.sp = serial.Serial(timeout=3)
+            self.sp = serial.Serial(timeout=OBD_SERIAL_PROBE_TIMEOUT)
             self.sp.port = self.filename
             self.sp.open()
             
@@ -406,21 +579,43 @@ class OBD():
                 raise Exception("Unable to open serial port")
                 
             
-            # Configure the modem
-            self.sp.write(b'\r')        # Wake the part
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("No data received. Not connected/wrong serial port?")
-            self.sp.write(b'atz\r\n')   # Reset the device
-            reset_response = self.sp.read_until(b'>')
-            if (len(reset_response) == 0): raise Exception("No data received after reset attempt 1. Wrong serial port?")
-            if (b'OK' not in reset_response):
-                # Seems we interrupted a command, let's try again
-                self.sp.write(b'atz\r\n')   # Reset the device
-                reset_response = self.sp.read_until(b'>')
-                if (len(reset_response) == 0): raise Exception("No data received after reset attempt 2. Wrong serial port?")
-                if (reset_response[-1] != ord('>')): raise Exception("Unexpected reset response: ", (reset_response.decode("utf-8")))
+            # Configure the modem (must be ELM text mode; if last session used DVI, recover first)
+            self.sp.reset_input_buffer()
+            self.sp.write(b'\r')
+            wake = self.sp.read_until(b'>')
+            if len(wake) == 0:
+                self._recover_from_obdx_dvi_mode()
+                self.sp.write(b'\r')
+                wake = self.sp.read_until(b'>')
+            if len(wake) == 0:
+                raise Exception("No data received. Not connected/wrong serial port?")
 
-            self.sp.write(b'atz\r\n')   # Reset the device
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
+            reset_ok = False
+            for attempt in range(3):
+                self.sp.write(b'atz\r\n')
+                reset_response = self.sp.read_until(b'>')
+                if len(reset_response) == 0:
+                    if attempt < 2:
+                        self._recover_from_obdx_dvi_mode()
+                        continue
+                    raise Exception("No data received after ATZ. Wrong serial port?")
+                if b'OK' in reset_response and reset_response.rstrip().endswith(b'>'):
+                    reset_ok = True
+                    break
+                if attempt < 2:
+                    print("Unexpected ATZ response (adapter may be stuck in DVI); recovering...")
+                    self._recover_from_obdx_dvi_mode()
+                    continue
+                raise Exception(
+                    "Unexpected reset response after ATZ (expected OK and '>'). Raw: %r"
+                    % (reset_response,)
+                )
+            if not reset_ok:
+                raise Exception("Device did not accept ATZ reset")
+
+            self.sp.write(b'atz\r\n')
+            if len(self.sp.read_until(b'>')) == 0:
+                raise Exception("Device did not respond to final reset")
             self.sp.write(b'atl1\r\n')  # Enable new line characters between commands/messages
             if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
             
@@ -437,25 +632,24 @@ class OBD():
             self.dev_dxi_string = self.sp.read_until(b'>').decode("utf-8")
             self.dev_dxi_string = re.search('\n(.*?)( SN.*)?\r',self.dev_dxi_string).group(1)
 
-            if ("?" not in self.dev_sti_string):
-                self.dev_type = "STN"
-                self.dev_string = self.dev_sti_string
-            elif ("?" not in self.dev_dxi_string):
+            # Prefer OBDX when DX I responds — STN may also answer STI without '?'
+            if ("?" not in self.dev_dxi_string):
                 self.dev_type = "OBDX"
                 self.dev_string = self.dev_dxi_string
+            elif ("?" not in self.dev_sti_string):
+                self.dev_type = "STN"
+                self.dev_string = self.dev_sti_string
             else:
                 self.dev_type = "ELM"
                 self.dev_string = self.dev_ati_string
 
             print("Detected device was a",self.dev_type,"with a version string of:",self.dev_string)
-            
 
-            self.sp.write(b'atsp2\r\n') # Set protocol to VPW J1850
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
-            self.sp.write(b'ath1\r\n')  # Enable headers
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
-            self.sp.write(b'atma\r\n')  # Begin monitoring bus traffic
-            if (len(self.sp.read_until(b'\r\n')) == 0): raise Exception("Device did not enter atma mode")
+            if self.dev_type == "OBDX":
+                self._open_obdx_dvi_vp_monitor()
+            else:
+                self._open_elm_vp_monitor()
+            self.sp.timeout = OBD_SERIAL_RUNTIME_TIMEOUT
             print("Connected")
         else:
             self.fd = open(self.filename, 'r')
@@ -463,17 +657,128 @@ class OBD():
     def close(self):
         if self.serial:
             if self.sp.is_open:
-                self.sp.write(b'a\r\n')
-                time.sleep(1)
-                self.sp.close()
+                with self._sp_lock:
+                    if self.dvi_mode:
+                        try:
+                            self.sp.reset_input_buffer()
+                            # §3.11.3 — return to ELM so the next open() can use ATZ / DX DP 1
+                            self.sp.write(_dvi_pack(0x31, [0x06, 0x00]))
+                            time.sleep(0.2)
+                        except Exception:
+                            pass
+                        self.dvi_mode = False
+                    else:
+                        self.sp.write(b'a\r\n')
+                        time.sleep(1)
+                    self.sp.close()
         else:
             self.fd.close()
-        
+
     def read(self):
         if self.serial:
-            return self.sp.readline().decode("utf-8") 
+            with self._sp_lock:
+                if self.dvi_mode:
+                    if self._dvi_pending_lines:
+                        return self._dvi_pending_lines.pop(0) + "\n"
+                    end = time.perf_counter() + (self.sp.timeout or 3.0)
+                    while time.perf_counter() < end:
+                        self._dvi_feed()
+                        while True:
+                            popped = self._dvi_try_pop_frame()
+                            if popped is None:
+                                break
+                            rcmd, payload = popped
+                            if rcmd == 0x7F:
+                                print("OBDX DVI bus fault:", payload.hex())
+                                continue
+                            if rcmd in (0x08, 0x09):
+                                return self._vpw_bytes_to_hex_line(payload) + "\n"
+                            if rcmd in (0x20, 0x21):
+                                continue
+                            print("OBDX DVI unsolicited frame cmd=%02X: %s" % (rcmd, payload.hex()))
+                        time.sleep(0.002)
+                    return ""
+                return self.sp.readline().decode("utf-8")
         else:
             return self.fd.readline()
+
+    def send_message(self, header, payload):
+        """Send a VPW frame. OBDX DVI: 0x10/0x11 while monitoring. ELM/STN: exit ATMA, AT SH, send, AT MA."""
+        if not self.serial or not self.sp.is_open:
+            return False
+        with self._sp_lock:
+            try:
+                hdr = bytes.fromhex(header.replace(" ", ""))
+                pl = bytes.fromhex(payload.replace(" ", ""))
+                full = hdr + pl
+            except ValueError:
+                return False
+            if self.dvi_mode:
+                return self._dvi_send_message(full)
+            return self._elm_send_message(header, payload)
+
+    def _elm_send_message(self, header, payload):
+        """ELM327-style: break ATMA, set header, send hex payload, resume monitor."""
+        try:
+            h = "".join(header.split())
+            if len(h) % 2 != 0 or not h:
+                return False
+            spaced = " ".join(h[i : i + 2].upper() for i in range(0, len(h), 2))
+            pls = "".join(payload.split())
+            if len(pls) % 2 != 0:
+                return False
+            self.sp.write(b"\r")
+            time.sleep(0.08)
+            n = self.sp.in_waiting
+            if n:
+                self.sp.read(n)
+            self.sp.write(f"at sh {spaced}\r\n".encode())
+            if len(self.sp.read_until(b">")) == 0:
+                return False
+            self.sp.write(f"{pls}\r\n".encode())
+            if len(self.sp.read_until(b">")) == 0:
+                return False
+            self.sp.write(b"atma\r\n")
+            if len(self.sp.read_until(b"\r\n")) == 0:
+                if len(self.sp.read_until(b">")) == 0:
+                    return False
+            return True
+        except Exception as e:
+            print(f"ELM send_message: {e}")
+            return False
+
+    def _dvi_send_message(self, full_frame):
+        """Send-to-network (manual §3.6/3.7). Caller must hold self._sp_lock."""
+        try:
+            if len(full_frame) > 255:
+                body = bytes([0x11]) + len(full_frame).to_bytes(2, "big") + full_frame
+                pkt = body + bytes([_dvi_checksum(body)])
+            else:
+                pkt = _dvi_pack(0x10, full_frame)
+            self.sp.write(pkt)
+            end = time.perf_counter() + 3.0
+            while time.perf_counter() < end:
+                self._dvi_feed()
+                while True:
+                    popped = self._dvi_try_pop_frame()
+                    if popped is None:
+                        break
+                    rcmd, body = popped
+                    if rcmd in (0x08, 0x09):
+                        self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(body))
+                        continue
+                    if rcmd == 0x7F:
+                        print("OBDX DVI send fault:", body.hex())
+                        return False
+                    if rcmd in (0x20, 0x21):
+                        return True
+                    # Other DVI responses (e.g. config ack) — ignore while waiting for 20/21
+                    continue
+                time.sleep(0.002)
+            return False
+        except Exception as e:
+            print(f"DVI send_message: {e}")
+            return False
         
     def is_open(self):
         if self.serial:
@@ -980,7 +1285,9 @@ class VPW_frame:
             print ("Issue processing: ", byteString)
             return None
             
-        if len(byteArray) < 5:
+        # OBDX DVI (and similar) often omits the trailing VPW CRC on passive RX, so frames
+        # are 4 bytes (Hdr, TA, SA, one data) instead of 5 with CRC — especially heartbeats.
+        if len(byteArray) < 4:
             return None
 
         mode = 'F'
@@ -1061,9 +1368,8 @@ class VPW_frame:
             # Check for heart beat
         isHeartBeat = False
         if (byteArray[1] == 0xFF or byteArray[1] == 0xFE):
-            if (len(byteArray) == 5):
-                if (byteArray[3] == 0x03):
-                    isHeartBeat = True
+            if byteArray[3] == 0x03 and len(byteArray) in (4, 5):
+                isHeartBeat = True
 
         return {'priority': priority, 'mode': mode, 'mode type': modeType, 'mode operation': modeOp, 'message': byteArray, 'heartbeat': isHeartBeat}
         
@@ -1203,7 +1509,7 @@ class MessageManager():
         self.filter_compare_bytes = 2
         self.hide_heartbeat = False
         
-    def new_message(self, input_string):
+    def new_message(self, input_string, skip_summary=False, transmit_echo=False):
         # Send string off to get parsed
         inString = input_string.rstrip()
         newMsg = VPW_frame.process(inString)
@@ -1211,6 +1517,9 @@ class MessageManager():
         # If object is NoneType, then it failed to parse. Potentially invalid packet
         if not (newMsg):
             print ("Invalid message recieved in new_message: ", input_string)
+            return
+
+        if newMsg["heartbeat"] and self.UIHook.hideHeartbeatsEverywhere.get() and not transmit_echo:
             return
         
         #Decode address
@@ -1249,16 +1558,25 @@ class MessageManager():
             saModule = str("${:02X}".format(newMsg["message"][2])+" "+VPW_frame.phys_addresses[newMsg["message"][2]])
         else:
             saModule = "${:02X}".format(newMsg["message"][2])
+
+        if transmit_echo:
+            if description and description != "NA":
+                description = "[TX] " + description
+            else:
+                description = "[TX] (transmitted)"
         
         # Append message to data frame (now includes data value and description)
         self.messageHistory.append([len(self.messageHistory), newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], inString, data_value, description])
 
         tempMsg = self.messageHistory[-1]
+        tree_tags = ("tx_frame",) if transmit_echo else ()
+        self.UIHook.new_message(tempMsg, tags=tree_tags)
+        self.UIHook.update_status_bar(len(self.messageHistory))
         
-        # See if an existing message exists
+        if skip_summary:
+            return
+        
         summaryInd = self.find_existing_summary(tempMsg)
-        self.UIHook.new_message(tempMsg)
-        self.UIHook.update_status_bar( len(self.messageHistory))
         
         # If hide heart beat is enabled, we'll just skip adding it to the summary altogether
         if (newMsg["heartbeat"] and self.UIHook.hideHeartbeats.get()):
@@ -1305,19 +1623,26 @@ class MessageManager():
                 elif (byteCompare == 0):
                     for row in rows:    
                         return row[0]
-                elif (byteCompare == 1):
+                elif byteCompare == 1:
                     for row in rows:
-                        if (row[9][0] == msg[7][0]):
+                        rp, mp = row[9], msg[7]
+                        if len(rp) == 0 and len(mp) == 0:
                             return row[0]
-                elif (byteCompare == 2):
+                        if len(rp) >= 1 and len(mp) >= 1 and rp[0] == mp[0]:
+                            return row[0]
+                elif byteCompare == 2:
                     for row in rows:
-                        if (row[9][0] == msg[7][0]):
-                            if (len(row[9]) == 1):
-                                return row[0]
-                            else:
-                                if (row[9][1] == msg[7][1]):
-                                    return row[0]                        
-                        
+                        rp, mp = row[9], msg[7]
+                        if len(rp) == 0 and len(mp) == 0:
+                            return row[0]
+                        if len(rp) < 1 or len(mp) < 1:
+                            continue
+                        if rp[0] != mp[0]:
+                            continue
+                        if len(rp) == 1:
+                            return row[0]
+                        if len(mp) >= 2 and rp[1] == mp[1]:
+                            return row[0]
             
         return -1
     
@@ -1437,23 +1762,16 @@ class ToolManager:
         if not self.obd.serial:
             return False  # Can't send to file
         
-        # Track mode transitions during send operation
-        # Device starts in MONITOR_MODE, transitions to COMMAND_MODE when exiting ATMA,
-        # then back to MONITOR_MODE after sending
-        if self.device_mode == DeviceMode.MONITOR_MODE:
-            self.device_mode = DeviceMode.COMMAND_MODE  # Will exit ATMA mode
-        
-        # Use the OBD's send_message method
+        # ELM/STN: ATMA must stop for AT commands, then resume. OBDX DVI: send uses 0x10 while RX continues.
+        use_elm_atma_cycle = not self.obd.dvi_mode
+        if use_elm_atma_cycle and self.device_mode == DeviceMode.MONITOR_MODE:
+            self.device_mode = DeviceMode.COMMAND_MODE
+
         success = self.obd.send_message(header, payload)
-        
-        # After sending, device should be back in monitor mode
-        if success:
+
+        if use_elm_atma_cycle:
             self.device_mode = DeviceMode.MONITOR_MODE
-        else:
-            # If send failed, try to restore to monitor mode
-            # (OBD.send_message should handle this, but just in case)
-            self.device_mode = DeviceMode.MONITOR_MODE
-        
+
         return success
     
     def get_obd_instance(self):
@@ -1562,16 +1880,26 @@ class ThreadedTask(threading.Thread):
 Main application class that handles the GUI
 '''
 class Application(tk.Frame):
-    def __init__(self, root):
+    def __init__(self, root, initial_open=None):
         self.root = root
+        self._initial_open = (initial_open or "").strip() or None
         self.queue = queue.Queue()
         # Create ToolManager to handle OBD device state
         self.tool_manager = ToolManager(self.queue, status_callback=self.update_obd_status)
+        self._last_send_selection = None
         self.initialize_user_interface()
         self.update_status_bar(False)
         self.mm = MessageManager(self)
         # Start the queue processing
         self.update_ui()
+        if self._initial_open:
+            self.root.after_idle(self._apply_initial_open)
+
+    def _apply_initial_open(self):
+        """CLI: pre-fill OBD Device field and run Read (serial port or log file path)."""
+        self.serial_port_entry.delete(0, tk.END)
+        self.serial_port_entry.insert(0, self._initial_open)
+        self.read_file()
  
     def initialize_user_interface(self):
         # Configure the root object for the Application
@@ -1591,7 +1919,9 @@ class Application(tk.Frame):
         self.statusBarString = tk.StringVar()
         self.statusBarOBDString = tk.StringVar()
         self.messageTreeLock = tk.BooleanVar()
-        self.hideHeartbeats = tk.BooleanVar()
+        self.hideHeartbeats = tk.BooleanVar(master=self.root, value=True)
+        self.hideHeartbeatsEverywhere = tk.BooleanVar(master=self.root, value=True)
+        self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=False)
         self.messageUniqueByte = tk.StringVar()
         self.messageUniqueByte.set("2")
         
@@ -1689,6 +2019,15 @@ class Application(tk.Frame):
         
         # Bind double-click event to message tree
         self.messageTree.bind('<Double-1>', self.on_message_double_click)
+        # Last row chosen for "Send Selected Message" — highlight persists until another row is clicked
+        for tv in (self.summaryTree, self.messageTree):
+            # Strong warm highlight so the send-target row is obvious on grey / default tree rows
+            tv.tag_configure("last_send_row", background="#ffb020", foreground="#000000")
+        self.messageTree.tag_configure("tx_frame", background="#a5d6a7", foreground="#1b4332")
+        self.summaryTree.bind("<<TreeviewSelect>>", self._on_summary_or_message_tree_select)
+        self.messageTree.bind("<<TreeviewSelect>>", self._on_summary_or_message_tree_select)
+        self.summaryTree.bind("<space>", self._on_trees_space_send_selected)
+        self.messageTree.bind("<space>", self._on_trees_space_send_selected)
         
         ''' Configuration Frame '''
         self.config_frame = tk.Frame(self.root, borderwidth = 1)
@@ -1724,30 +2063,30 @@ class Application(tk.Frame):
         self.submit_button = tk.Button(self.config_frame, text="Parse", command=self.insert_data)
         self.submit_button.grid(row=4, column=1, sticky=tk.W)
         self.read_button = tk.Button(self.config_frame, text="Read", command=self.read_file)
-        self.read_button.grid(row=4, column=1, sticky='e')
+        self.read_button.grid(row=4, column=2, sticky=tk.W)
  
  
- 
- 
-        # View settings
-        self.config_label = tk.Label(self.config_frame, text="View Settings")
-        self.config_label.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+        # View settings (own rows so they do not overlap Parse/Read)
+        self.view_settings_label = tk.Label(self.config_frame, text="View Settings")
+        self.view_settings_label.grid(row=5, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
-        config_sep.grid(row=5, columnspan = 3, sticky='ew')
+        config_sep.grid(row=6, columnspan=3, sticky='ew')
         
-        self.view_hideHeartbeats = tk.Checkbutton(self.config_frame, text="Hide Module Heartbeats", variable=self.hideHeartbeats, onvalue=True, offvalue=False)
-        self.view_hideHeartbeats.grid(row=6,column=0, sticky=tk.E)
+        self.view_hideHeartbeats = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from summary table", variable=self.hideHeartbeats, onvalue=True, offvalue=False)
+        self.view_hideHeartbeats.grid(row=7, column=0, columnspan=3, sticky=tk.W)
+        self.view_hideHeartbeatsEverywhere = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from everything", variable=self.hideHeartbeatsEverywhere, onvalue=True, offvalue=False)
+        self.view_hideHeartbeatsEverywhere.grid(row=8, column=0, columnspan=3, sticky=tk.W)
         
         self.view_uniqueByte_label = tk.Label(self.config_frame, text="Compare First # Bytes")
-        self.view_uniqueByte_label.grid(row=7,column=0)
+        self.view_uniqueByte_label.grid(row=9, column=0, sticky=tk.W)
         self.view_uniqueByte = tk.OptionMenu(self.config_frame, self.messageUniqueByte, "0", "1", "2", "All")
-        self.view_uniqueByte.grid(row=7,column=1, sticky=tk.W)
+        self.view_uniqueByte.grid(row=9, column=1, sticky=tk.W)
         
         self.delete_button = tk.Button(self.config_frame, text="Clear Message Logs", command=self.delete_data)
-        self.delete_button.grid(row=100, column=0)
+        self.delete_button.grid(row=100, column=0, sticky=tk.W)
         
         self.delete_button = tk.Button(self.config_frame, text="Export Logs", command=self.export_log)
-        self.delete_button.grid(row=100, column=1)
+        self.delete_button.grid(row=100, column=1, sticky=tk.W)
  
         
         
@@ -1758,7 +2097,7 @@ class Application(tk.Frame):
         ''' Transmit Message Frame '''
         self.transmit_frame = tk.Frame(self.root, borderwidth = 1)
         self.transmit_frame.grid(row=3, column = 3, rowspan=1, sticky='nsew')
-        self.transmit_frame.grid_rowconfigure(5, minsize=10)
+        self.transmit_frame.grid_rowconfigure(8, minsize=10)
         self.transmit_frame.grid_rowconfigure(90, weight=1)
         
         self.config_label = tk.Label(self.transmit_frame, text="Transmit Frame")
@@ -1786,14 +2125,23 @@ class Application(tk.Frame):
         self.payload_entry.bind('<Control-a>', self.select_all_text)
         self.payload_entry.bind('<Control-A>', self.select_all_text)
         
-        self.send_button = tk.Button(self.transmit_frame, text="Send")
-        self.send_button.grid(row=4, column=1, sticky='s')
+        self.view_show_transmitted = tk.Checkbutton(
+            self.transmit_frame,
+            text="Show transmitted frames in message history",
+            variable=self.showTransmittedFrames,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.view_show_transmitted.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 4))
+        
+        self.send_button = tk.Button(self.transmit_frame, text="Send", command=self.on_transmit_send)
+        self.send_button.grid(row=5, column=1, sticky='s')
         
         config_sep = ttk.Separator(self.transmit_frame, orient='horizontal')
-        config_sep.grid(row=5, columnspan = 2, sticky='ew')
+        config_sep.grid(row=6, columnspan=2, sticky='ew')
         
-        self.send_selected_button = tk.Button(self.transmit_frame, text="Send Selected Message")
-        self.send_selected_button.grid(row=6, column=0, sticky='s')
+        self.send_selected_button = tk.Button(self.transmit_frame, text="Send Selected Message", command=self.on_transmit_send_selected)
+        self.send_selected_button.grid(row=7, column=0, sticky='s')
         
         self.help_button = tk.Button(self.transmit_frame, text="Help", command=self.show_help)
         self.help_button.grid(row=100, column=1, sticky='s')
@@ -1874,11 +2222,26 @@ class Application(tk.Frame):
                 messagebox.showerror("Export Error", f"Failed to export logs:\n{e}")
         
 
-    def new_message(self, newMsg):        
+    def new_message(self, newMsg, tags=()):
         # Print the message to the message history tree
-        self.messageTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
-                             values=("{:02X}".format(newMsg[1]), newMsg[4], newMsg[5],
-                             newMsg[6], newMsg[2], newMsg[3], str(" ".join(["{:02X}".format(x) for x in newMsg[7][:-1]])), newMsg[9], newMsg[10]))
+        self.messageTree.insert(
+            "",
+            "end",
+            iid=newMsg[0],
+            text=str(newMsg[0]),
+            values=(
+                "{:02X}".format(newMsg[1]),
+                newMsg[4],
+                newMsg[5],
+                newMsg[6],
+                newMsg[2],
+                newMsg[3],
+                _vpw_payload_hex_for_display(newMsg[7]),
+                newMsg[9],
+                newMsg[10],
+            ),
+            tags=tags,
+        )
 
         # If the scroll lock is enabled, then scroll down
         if (self.messageTreeLock.get()):
@@ -1892,14 +2255,14 @@ class Application(tk.Frame):
         # Print the message to the message history tree
         self.summaryTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
                              values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
-                             newMsg[8], newMsg[4], newMsg[5], str(" ".join(["{:02X}".format(x) for x in newMsg[9][:-1]])), newMsg[10], newMsg[11]))
+                             newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
         #self.sid = self.sid + 1
         
         
     def update_message_summary(self, index, newMsg):
         try:
             self.summaryTree.item(index, text=str(index),
-                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], str(" ".join(["{:02X}".format(x) for x in newMsg[9][:-1]])), newMsg[10], newMsg[11]))
+                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
         except ValueError:
             print ("Issue updating index, ", newMsg)
             for child in self.summaryTree.get_children():
@@ -1914,6 +2277,8 @@ class Application(tk.Frame):
             
         for i in self.messageTree.get_children():
             self.messageTree.delete(i)
+        
+        self._last_send_selection = None
             
         self.mm = MessageManager(self)
             
@@ -1924,6 +2289,118 @@ class Application(tk.Frame):
         file_path = self.serial_port_entry.get()
         # Use ToolManager to handle connection
         self.tool_manager.connect(file_path)
+
+    def _clear_last_send_row_highlight(self):
+        if not self._last_send_selection:
+            return
+        tree, iid = self._last_send_selection
+        try:
+            tree.item(iid, tags=())
+        except tk.TclError:
+            pass
+        self._last_send_selection = None
+
+    def _set_last_send_row_highlight(self, tree, iid):
+        """One row across both trees keeps tag last_send_row until another row is chosen."""
+        if self._last_send_selection and self._last_send_selection[0] == tree and self._last_send_selection[1] == iid:
+            return
+        self._clear_last_send_row_highlight()
+        try:
+            tree.item(iid, tags=("last_send_row",))
+            self._last_send_selection = (tree, iid)
+        except tk.TclError:
+            self._last_send_selection = None
+
+    def _on_summary_or_message_tree_select(self, event):
+        w = event.widget
+        if w not in (self.summaryTree, self.messageTree):
+            return
+        sel = w.selection()
+        if not sel:
+            return
+        self._set_last_send_row_highlight(w, sel[0])
+
+    def _on_trees_space_send_selected(self, event):
+        if event.widget not in (self.summaryTree, self.messageTree):
+            return
+        self.on_transmit_send_selected()
+        return "break"
+
+    def _maybe_record_transmit_echo(self, hdr, pl):
+        if not self.showTransmittedFrames.get():
+            return
+        line = f"{hdr} {pl}".strip()
+        self.mm.new_message(line, skip_summary=True, transmit_echo=True)
+
+    def on_transmit_send(self):
+        """Send Header + Payload using DVI (OBDX) or ELM/STN path."""
+        if not self.tool_manager.is_connected:
+            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            return
+        if not self.tool_manager.obd or not self.tool_manager.obd.serial:
+            messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
+            return
+        hdr = self.header_entry.get().strip()
+        pl = self.payload_entry.get().strip()
+        if not hdr or not pl:
+            messagebox.showwarning("Transmit", "Enter both Header and Payload (hex bytes).")
+            return
+        ok = self.tool_manager.send_message(hdr, pl)
+        if ok:
+            self._maybe_record_transmit_echo(hdr, pl)
+            cur = self.statusBarOBDString.get()
+            if cur.startswith("OBD: Connected"):
+                base = cur.split(" — ")[0]
+                self.statusBarOBDString.set(base + " — Last transmit: OK")
+        else:
+            messagebox.showerror(
+                "Transmit failed",
+                "The adapter did not acknowledge the send. Check hex fields and connection.",
+            )
+
+    def on_transmit_send_selected(self):
+        """Send the last single-clicked row from Summary or Message history (see highlight)."""
+        if not self.tool_manager.is_connected:
+            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            return
+        if not self.tool_manager.obd or not self.tool_manager.obd.serial:
+            messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
+            return
+        if not self._last_send_selection:
+            messagebox.showwarning(
+                "No row chosen",
+                "Click a row in Summary or Message history to choose what to send (it will highlight).",
+            )
+            return
+        tree, iid = self._last_send_selection
+        try:
+            vals = tree.item(iid, "values")
+        except tk.TclError:
+            self._last_send_selection = None
+            messagebox.showwarning("Send target", "That row no longer exists. Click another message.")
+            return
+        is_summary = tree is self.summaryTree
+        pair = self._header_payload_from_values(vals, is_summary)
+        if not pair:
+            messagebox.showerror("Send target", "Could not build a frame from the selected row.")
+            return
+        hdr, pl = pair
+        self.header_entry.delete(0, tk.END)
+        self.header_entry.insert(0, hdr)
+        self.payload_entry.delete(0, tk.END)
+        self.payload_entry.insert(0, pl)
+        ok = self.tool_manager.send_message(hdr, pl)
+        if ok:
+            self._maybe_record_transmit_echo(hdr, pl)
+            cur = self.statusBarOBDString.get()
+            if cur.startswith("OBD: Connected"):
+                base = cur.split(" — ")[0]
+                self.statusBarOBDString.set(base + " — Last transmit: OK")
+        else:
+            messagebox.showerror(
+                "Transmit failed",
+                "The adapter did not acknowledge the send. Check the highlighted row and connection.",
+            )
 
     def update_ui(self):
         # Process any messages in the queue
@@ -1956,48 +2433,39 @@ class Application(tk.Frame):
             values = self.messageTree.item(item, 'values')
             self.populate_transmit_frame(values, is_summary=False)
     
-    def populate_transmit_frame(self, values, is_summary=False):
-        """Populate transmit frame fields with data from selected row"""
+    def _header_payload_from_values(self, values, is_summary):
+        """Build transmit header + payload hex strings from a tree row's column values."""
         try:
             if is_summary:
-                # Summary tree columns: 'Last MID', '# Msgs', 'Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload', 'Data', 'Description'
-                if len(values) >= 10:
-                    hdr = values[2]    # Hdr column (e.g., "8C")
-                    ta = values[6]     # TA column (e.g., "$83 (S) Fuel System")
-                    sa = values[7]     # SA column (e.g., "$10 ECU")
-                    payload = values[8]  # Payload column
-                else:
-                    print("Error: Not enough columns in summary tree data")
-                    return
+                if len(values) < 10:
+                    return None
+                hdr, ta, sa, payload = values[2], values[6], values[7], values[8]
             else:
-                # Message tree columns: 'Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload', 'Data', 'Description'
-                if len(values) >= 8:
-                    hdr = values[0]    # Hdr column (e.g., "8C")
-                    ta = values[4]     # TA column (e.g., "$83 (S) Fuel System")
-                    sa = values[5]     # SA column (e.g., "$10 ECU")
-                    payload = values[6]  # Payload column
-                else:
-                    print("Error: Not enough columns in message tree data")
-                    return
-            
-            # Extract hex values from TA and SA columns
+                if len(values) < 8:
+                    return None
+                hdr, ta, sa, payload = values[0], values[4], values[5], values[6]
             ta_hex = self.extract_hex_from_column(ta)
             sa_hex = self.extract_hex_from_column(sa)
-            
-            # Construct the header: Hdr + TA + SA
             if ta_hex and sa_hex:
                 header = f"{hdr} {ta_hex} {sa_hex}"
             else:
-                header = hdr  # Fallback to just the Hdr column if extraction fails
-            
-            # Clear existing values
+                header = str(hdr)
+            return (header.strip(), str(payload).strip())
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def populate_transmit_frame(self, values, is_summary=False):
+        """Populate transmit frame fields with data from selected row"""
+        try:
+            pair = self._header_payload_from_values(values, is_summary)
+            if not pair:
+                print("Error: Not enough columns or bad data in tree row")
+                return
+            header, payload = pair
             self.header_entry.delete(0, tk.END)
             self.payload_entry.delete(0, tk.END)
-            
-            # Populate the fields
             self.header_entry.insert(0, header)
             self.payload_entry.insert(0, payload)
-            
         except Exception as e:
             print(f"Error populating transmit frame: {e}")
     
@@ -2008,7 +2476,6 @@ class Application(tk.Frame):
                 return None
             
             # Look for hex pattern like $83, 83, 0x83, etc.
-            import re
             hex_match = re.search(r'[\$]?([0-9A-Fa-f]{2})', column_value)
             if hex_match:
                 return hex_match.group(1).upper()
@@ -2054,7 +2521,8 @@ class Application(tk.Frame):
 
 
 
-if __name__ == "__main__" :
-    app = Application(tk.Tk())
+if __name__ == "__main__":
+    initial = sys.argv[1] if len(sys.argv) > 1 else None
+    app = Application(tk.Tk(), initial_open=initial)
     app.root.wm_protocol("WM_DELETE_WINDOW", app.on_app_close)
     app.root.mainloop()
