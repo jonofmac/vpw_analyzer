@@ -2,7 +2,6 @@
 VPW Analyzer
 By Jonathan Valdez
 
-Version 0.3 - Feb 1, 2022
 Description: This is a utility that parses incoming messages from a VPW interface
     into a more human-readable format. The bottom box shows each message that was
     received in order. The top box shows unique messages that were received.
@@ -10,15 +9,12 @@ Description: This is a utility that parses incoming messages from a VPW interfac
     the COM port number into the 'OBD Device Port' and press 'Read/Open'. If on Unix
     based system, type in the full path (/dev/serialTTY) and press 'Read/Open'.
 
+Version 0.4 - Apr 11, 2026
 Changes
-    - TBD
-
-
-Version 0.2 - Jan 26, 2022
-Changes
-    - Fixed crashing on exit
-    - Added some device response verification steps
-    - Query device string to get model and firmware info
+    - Added support for OBDX Pro VT
+    - Added support for VPW log files
+    - Added support time stamps
+    - Added support transmitting for OBDX Pro VT
 '''
 from logging import exception
 from enum import Enum
