@@ -2,35 +2,40 @@
 VPW Analyzer
 By Jonathan Valdez
 
-Version 0.3 - Feb 1, 2022
 Description: This is a utility that parses incoming messages from a VPW interface
     into a more human-readable format. The bottom box shows each message that was
     received in order. The top box shows unique messages that were received.
     It connects to an ELM327 like device via a serial port. If on Windows, type
-    the COM port number into the 'OBD Device Port' and press 'Read'. If on Unix
-    based system, type in the full path (/dev/serialTTY) and press 'Read'.
+    the COM port number into the 'OBD Device Port' and press 'Read/Open'. If on Unix
+    based system, type in the full path (/dev/serialTTY) and press 'Read/Open'.
 
+Version 0.5 - Apr 11, 2026
 Changes
-    - TBD
-
-
-Version 0.2 - Jan 26, 2022
-Changes
-    - Fixed crashing on exit
-    - Added some device response verification steps
-    - Query device string to get model and firmware info
+    - Added support for OBDX Pro VT
+    - Added support for VPW log files
+    - Added support time stamps
+    - Added support transmitting for OBDX Pro VT
 '''
 from logging import exception
 from enum import Enum
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog
+
+from message_queue_window import (
+    MessageQueueStore,
+    description_from_tree_values,
+    destroy_message_queue_window_if_any,
+    open_or_raise_message_queue_window,
+)
 import tkinter.ttk as ttk
 import queue
 import sys
 import threading
+from collections import deque
 import time
 import serial
 import re
+import string
 
 
 # Short read timeout while probing ELM prompts (adapter stuck in DVI won't send '>')
@@ -57,13 +62,121 @@ def _dvi_reboot_to_boot_frame():
     return bytes([0x25, 0x00, _dvi_checksum([0x25, 0x00])])
 
 
+def _vpw_crc8_sae_j1850(body: bytes) -> int:
+    """
+    One-byte VPW frame CRC (CRC-8/SAE-J1850 style: poly 0x1D, init 0xFF, xorout 0xFF, MSB-first).
+    ``body`` is the full frame without the CRC byte (header + payload).
+    """
+    crc = 0xFF
+    for b in body:
+        crc ^= b
+        for _ in range(8):
+            if crc & 0x80:
+                crc = ((crc << 1) ^ 0x1D) & 0xFF
+            else:
+                crc = (crc << 1) & 0xFF
+    return crc ^ 0xFF
+
+
+def _vpw_frame_append_crc_if_missing(frame: bytes) -> bytes:
+    """
+    If the last byte is already a valid VPW CRC for the preceding bytes, return ``frame`` unchanged.
+    Otherwise append the CRC for the whole frame (OBDX DVI passive RX / older exports omit bus CRC).
+    """
+    frame = bytes(frame)
+    if len(frame) < 3:
+        return frame
+    if len(frame) >= 4 and _vpw_crc8_sae_j1850(frame[:-1]) == frame[-1]:
+        return frame
+    return frame + bytes([_vpw_crc8_sae_j1850(frame)])
+
+
+def _vpw_hex_line_append_crc_if_missing(hex_line: str) -> str:
+    """Normalize a VPW hex text line so it includes a trailing CRC when absent (log import / Parse)."""
+    s = hex_line.strip()
+    if not s or not VPW_frame.is_valid(s):
+        return hex_line
+    try:
+        raw = bytes.fromhex(s.replace(" ", ""))
+    except ValueError:
+        return hex_line
+    if len(raw) < 3:
+        return hex_line
+    fixed = _vpw_frame_append_crc_if_missing(raw)
+    if fixed == raw:
+        return hex_line
+    return " ".join(f"{b:02X}" for b in fixed)
+
+
+# Bytes shown as characters in "try decode ASCII" payload view (letters, digits, punctuation, space).
+_ASCII_PAYLOAD_VIEW_BYTES = frozenset(
+    (string.ascii_letters + string.digits + string.punctuation + " ").encode("latin-1")
+)
+
+
+def _vpw_payload_body_bytes(payload_bytes):
+    """Payload bytes shown in the Payload column (strip trailing CRC when multi-byte)."""
+    if not payload_bytes:
+        return b""
+    pb = bytes(payload_bytes)
+    if len(pb) == 1:
+        return pb
+    return pb[:-1]
+
+
 def _vpw_payload_hex_for_display(payload_bytes):
     """Format payload for Treeview; strip trailing CRC when present (ELM). DVI often has no CRC."""
-    if not payload_bytes:
+    body = _vpw_payload_body_bytes(payload_bytes)
+    if not body:
         return ""
-    if len(payload_bytes) == 1:
-        return "{:02X}".format(payload_bytes[0])
-    return " ".join("{:02X}".format(x) for x in payload_bytes[:-1])
+    return " ".join("{:02X}".format(x) for x in body)
+
+
+def _vpw_payload_hex_with_ascii_bracket(payload_bytes):
+    """Space-separated hex plus a bracketed ASCII run (~ for non-printable-set bytes)."""
+    hx = _vpw_payload_hex_for_display(payload_bytes)
+    body = _vpw_payload_body_bytes(payload_bytes)
+    if not body:
+        return hx
+    chars = []
+    for b in body:
+        chars.append(chr(b) if b in _ASCII_PAYLOAD_VIEW_BYTES else "~")
+    bracket = "[" + "".join(chars) + "]"
+    return f"{hx} {bracket}" if hx else bracket
+
+
+def _vpw_payload_column_text(payload_bytes, try_ascii):
+    if try_ascii:
+        return _vpw_payload_hex_with_ascii_bracket(payload_bytes)
+    return _vpw_payload_hex_for_display(payload_bytes)
+
+
+def _vpw_payload_hex_for_transmit(payload_bytes):
+    """Space-separated hex for transmit / queue (same body as Payload column, never ASCII)."""
+    return _vpw_payload_hex_for_display(payload_bytes)
+
+
+# Datalog lines may start with relative receive time in seconds (exactly three fractional digits).
+_VPW_LOG_TIMESTAMP_PREFIX_RE = re.compile(r"^(\d+\.\d{3})\s+(.+)$")
+
+
+def _split_vpw_logfile_line(line):
+    """
+    Parse optional leading timestamp from a saved log line.
+    Returns (hex_line, relative_seconds_or_none). Timestamp must use exactly three decimal places.
+    """
+    s = (line or "").strip()
+    if not s:
+        return ("", None)
+    m = _VPW_LOG_TIMESTAMP_PREFIX_RE.match(s)
+    if m:
+        return (m.group(2).strip(), float(m.group(1)))
+    return (s, None)
+
+
+def _format_vpw_export_timestamp(seconds):
+    """Export / display relative time with exactly three decimal places."""
+    return f"{float(seconds):.3f}"
 
 
 # Help text for the application
@@ -80,12 +193,12 @@ OBD Device Serial Port Field:
 • For file analysis: Enter the full path to a VPW log file
   - Example: /home/user/vpw_log.txt
   - Example: C:\\Users\\User\\Documents\\vpw_log.txt
-• Click "Read" to open the port/file and start parsing
-• From a terminal you can run: python vpw_analyzer.py <path> — the path is filled in and Read runs automatically
+• Click "Read/Open" to open the port or log file and start parsing; use "Close port" to stop the reader thread and close the serial device cleanly
+• From a terminal you can run: python vpw_analyzer.py <path> — the path is filled in and Read/Open runs automatically
 
 Raw Line Input:
 • Manually enter VPW messages for parsing
-• Format: 3-byte header + data + checksum/CRC
+• Format: 3-byte header + data + checksum/CRC (if the CRC byte is missing—common with OBDX DVI exports—the program adds SAE J1850 CRC-8 before parsing, same as live DVI capture)
 • Example: 8C F1 10 11 80 24 5A
 • Click "Parse" to process the message
 
@@ -98,7 +211,11 @@ Tips & Tricks:
 • Adjust "Compare First # Bytes" to control how messages are grouped in the summary table
 • Click once on a row in Summary or Message history to mark it (highlight) for "Send Selected Message"; double-click still fills the transmit fields only
 • With focus in Summary or Message history, Space triggers Send Selected Message (same as the button)
-• Enable "Show transmitted frames in message history" to append each successful send as a green-tagged row with a [TX] description prefix
+• Right-click a row in Summary or Message history: Add to queue (new queue or append to an existing one). Open Message queues from the transmit panel to reorder messages, double-click Header/Payload/Description to edit (Enter saves, Esc cancels), Export/Import JSON, or send an entire queue in order; use Load into transmit to copy the selected row to the transmit fields
+• "Show transmitted frames in message history" is on by default; turn it off if you do not want each successful send appended as a green-tagged row with a [TX] description prefix
+• "Try to decode ASCII in payload column" (under View Settings) keeps the normal space-separated hex and appends a bracketed run (e.g. [A~b]) with one character per byte for letters, digits, punctuation, and space, or ~ otherwise; transmit, Send Selected, and Add to queue still use raw hex from the stored frame only
+• Live serial capture timestamps each frame when it is read from the adapter (ms internally, shown as seconds). Log files may optionally begin each line with a relative time in the form ``0.000`` (three decimal places), a space, then the hex frame; Read/Open accepts both formats
+• Export Logs opens a dialog: you can include those timestamps at the start of each line when the history has capture times (optional per-line if some rows have no time)
 
 VPW Protocol Primer
 ===================
@@ -421,6 +538,8 @@ class OBD():
         self._dvi_rx_buffer = bytearray()
         self._dvi_pending_lines = []
         self._sp_lock = threading.RLock()
+        # Monotonic clock value when VPW passive monitoring began (ATMA / DVI network on); used for RX timestamps.
+        self._vpw_capture_t0 = None
         
         # There is probably a better way to determine if something is a serial device or not.
         if filename.lower().startswith("com") or filename.startswith("/dev"):
@@ -430,8 +549,12 @@ class OBD():
     def __del__ (self):
         self.close()
 
-    def _vpw_bytes_to_hex_line(self, body):
-        return " ".join(f"{b:02X}" for b in body)
+    def _vpw_bytes_to_hex_line(self, body, append_vpw_crc=False):
+        """Format raw VPW frame bytes as hex. If ``append_vpw_crc``, add SAE J1850 CRC when DVI omitted it."""
+        b = bytes(body)
+        if append_vpw_crc:
+            b = _vpw_frame_append_crc_if_missing(b)
+        return " ".join(f"{b:02X}" for b in b)
 
     def _dvi_try_pop_frame(self):
         """If a complete valid DVI frame is at the front of the buffer, consume and return (cmd, payload)."""
@@ -500,14 +623,39 @@ class OBD():
                     break
                 rcmd, payload = popped
                 if rcmd == 0x7F:
-                    raise Exception(f"OBDX DVI fault: {payload.hex()}")
+                    raise Exception(
+                        f"OBDX DVI fault (request cmd 0x{cmd:02X}): payload {payload.hex()} "
+                        "(0x7F = device rejected the command; often busy or not ready right after DX DP 1)"
+                    )
                 if rcmd in (0x08, 0x09):
-                    self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload))
+                    self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True))
                     continue
                 if rcmd == cmd + 0x10:
                     return payload
             time.sleep(0.002)
         raise Exception("OBDX DVI command timeout")
+
+    def _dvi_transact_setup_retry(self, cmd, data, timeout=3.0, max_attempts=4):
+        """
+        Send a DVI command during VPW monitor setup, retrying on transient 0x7F faults or timeouts.
+        USB / firmware sometimes NAKs the first 0x24/0x31 sequence right after ``DX DP 1``.
+        """
+        delays = (0.08, 0.15, 0.28)
+        for attempt in range(max_attempts):
+            try:
+                return self._dvi_transact(cmd, data, timeout=timeout)
+            except Exception as e:
+                es = str(e)
+                retryable = "OBDX DVI fault" in es or "OBDX DVI command timeout" in es
+                if not retryable or attempt >= max_attempts - 1:
+                    raise
+                if attempt < len(delays):
+                    time.sleep(delays[attempt])
+                else:
+                    time.sleep(0.35)
+                self.sp.reset_input_buffer()
+                self._dvi_rx_buffer.clear()
+                self._dvi_pending_lines.clear()
 
     def _open_obdx_dvi_vp_monitor(self):
         """Switch to DVI and enable VPW passive monitoring (OBDX Pro reference manual §3)."""
@@ -519,13 +667,15 @@ class OBD():
         self._dvi_rx_buffer.clear()
         self._dvi_pending_lines.clear()
         self.sp.reset_input_buffer()
+        time.sleep(0.06)
         # Timestamp off (default off; explicit), VPW protocol, network on — order per manual
         # §3.9.3: 24 02 03 NN — NN=00 timestamp off (explicit; default is off)
-        self._dvi_transact(0x24, [0x03, 0x00])
+        self._dvi_transact_setup_retry(0x24, [0x03, 0x00])
         # §3.11: "31 02 01 XX" = len 0x02, payload 0x01 (sub) + XX (VPW = 0x01)
-        self._dvi_transact(0x31, [0x01, 0x01])
+        self._dvi_transact_setup_retry(0x31, [0x01, 0x01])
         # "31 02 02 XX" = len 0x02, payload 0x02 (sub) + XX (network on = 0x01)
-        self._dvi_transact(0x31, [0x02, 0x01])
+        self._dvi_transact_setup_retry(0x31, [0x02, 0x01])
+        self._vpw_capture_t0 = time.perf_counter()
 
     def _recover_from_obdx_dvi_mode(self):
         """
@@ -558,7 +708,20 @@ class OBD():
         self.sp.write(b'atma\r\n')
         if (len(self.sp.read_until(b'\r\n')) == 0):
             raise Exception("Device did not enter atma mode")
-        
+        self._vpw_capture_t0 = time.perf_counter()
+
+    def _vpw_rx_timestamp_rel(self):
+        """Seconds since passive VPW capture started, or None if capture not armed."""
+        t0 = self._vpw_capture_t0
+        if t0 is None:
+            return None
+        return time.perf_counter() - t0
+
+    def reset_vpw_capture_epoch(self):
+        """Restart relative RX timestamps from now (live serial only). Used when clearing message logs."""
+        if self.serial:
+            self._vpw_capture_t0 = time.perf_counter()
+
     def open(self):
     
         if (self.serial):
@@ -675,11 +838,16 @@ class OBD():
             self.fd.close()
 
     def read(self):
+        """
+        Returns ``(line, recv_rel_sec)``.
+        ``line`` is a VPW hex line (often newline-terminated) or ``""`` at EOF / idle.
+        ``recv_rel_sec`` is seconds since VPW capture started on serial, from the log prefix when replaying a file, else None.
+        """
         if self.serial:
             with self._sp_lock:
                 if self.dvi_mode:
                     if self._dvi_pending_lines:
-                        return self._dvi_pending_lines.pop(0) + "\n"
+                        return (self._dvi_pending_lines.pop(0) + "\n", self._vpw_rx_timestamp_rel())
                     end = time.perf_counter() + (self.sp.timeout or 3.0)
                     while time.perf_counter() < end:
                         self._dvi_feed()
@@ -692,15 +860,31 @@ class OBD():
                                 print("OBDX DVI bus fault:", payload.hex())
                                 continue
                             if rcmd in (0x08, 0x09):
-                                return self._vpw_bytes_to_hex_line(payload) + "\n"
+                                return (
+                                    self._vpw_bytes_to_hex_line(payload, append_vpw_crc=True) + "\n",
+                                    self._vpw_rx_timestamp_rel(),
+                                )
                             if rcmd in (0x20, 0x21):
                                 continue
                             print("OBDX DVI unsolicited frame cmd=%02X: %s" % (rcmd, payload.hex()))
                         time.sleep(0.002)
-                    return ""
-                return self.sp.readline().decode("utf-8")
+                    return ("", None)
+                ln = self.sp.readline().decode("utf-8")
+                if not ln:
+                    return ("", None)
+                return (ln, self._vpw_rx_timestamp_rel())
         else:
-            return self.fd.readline()
+            raw = self.fd.readline()
+            if raw == "":
+                return ("", None)
+            if isinstance(raw, bytes):
+                text = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+            else:
+                text = raw.rstrip("\r\n")
+            hex_part, ts = _split_vpw_logfile_line(text)
+            if not hex_part:
+                return ("\n", None)
+            return (hex_part + "\n", ts)
 
     def send_message(self, header, payload):
         """Send a VPW frame. OBDX DVI: 0x10/0x11 while monitoring. ELM/STN: exit ATMA, AT SH, send, AT MA."""
@@ -765,7 +949,7 @@ class OBD():
                         break
                     rcmd, body = popped
                     if rcmd in (0x08, 0x09):
-                        self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(body))
+                        self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(body, append_vpw_crc=True))
                         continue
                     if rcmd == 0x7F:
                         print("OBDX DVI send fault:", body.hex())
@@ -1285,8 +1469,7 @@ class VPW_frame:
             print ("Issue processing: ", byteString)
             return None
             
-        # OBDX DVI (and similar) often omits the trailing VPW CRC on passive RX, so frames
-        # are 4 bytes (Hdr, TA, SA, one data) instead of 5 with CRC — especially heartbeats.
+        # OBDX DVI passive RX may omit the trailing VPW CRC; the UI layer appends SAE J1850 CRC-8 when missing so frames match ELM-style captures.
         if len(byteArray) < 4:
             return None
 
@@ -1509,9 +1692,16 @@ class MessageManager():
         self.filter_compare_bytes = 2
         self.hide_heartbeat = False
         
-    def new_message(self, input_string, skip_summary=False, transmit_echo=False):
-        # Send string off to get parsed
-        inString = input_string.rstrip()
+    def new_message(
+        self,
+        input_string,
+        skip_summary=False,
+        transmit_echo=False,
+        recv_rel_sec=None,
+        live_serial_rx=False,
+    ):
+        # Send string off to get parsed (add VPW CRC when missing so payload display matches ELM / bus)
+        inString = _vpw_hex_line_append_crc_if_missing(input_string.rstrip())
         newMsg = VPW_frame.process(inString)
         
         # If object is NoneType, then it failed to parse. Potentially invalid packet
@@ -1565,12 +1755,32 @@ class MessageManager():
             else:
                 description = "[TX] (transmitted)"
         
-        # Append message to data frame (now includes data value and description)
-        self.messageHistory.append([len(self.messageHistory), newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], inString, data_value, description])
+        # Append message to data frame (…, raw hex line, data value, description, relative RX time in s or None)
+        self.messageHistory.append(
+            [
+                len(self.messageHistory),
+                newMsg["message"][0],
+                taModule,
+                saModule,
+                newMsg["priority"],
+                newMsg["mode"],
+                newMsg["mode type"],
+                newMsg["message"][3:],
+                inString,
+                data_value,
+                description,
+                recv_rel_sec,
+            ]
+        )
 
         tempMsg = self.messageHistory[-1]
         tree_tags = ("tx_frame",) if transmit_echo else ()
         self.UIHook.new_message(tempMsg, tags=tree_tags)
+        if live_serial_rx and not transmit_echo:
+            hx = "".join(inString.split())
+            bus_n = len(hx) // 2
+            if bus_n > 0:
+                self.UIHook.record_serial_rx_sample(bus_n)
         self.UIHook.update_status_bar(len(self.messageHistory))
         
         if skip_summary:
@@ -1804,35 +2014,54 @@ class ThreadedTask(threading.Thread):
         print(f"Starting file processing: {self.file_path}")
 
         self.obd = OBD(self.file_path)
-        self.obd.open()
+        try:
+            self.obd.open()
+        except Exception as e:
+            print(f"Failed to open / configure device: {e}")
+            try:
+                self.obd.close()
+            except Exception:
+                pass
+            self.obd = None
+            return
+
         # Notify tool manager that device is connected
         if self.tool_manager:
             self.tool_manager.on_device_connected(self.obd, self.obd.dev_string)
 
-        
-        while (not self.stop_var):
-            try:
-                #time.sleep(0.1)  # Simulate long running process
-                line = self.obd.read()
-                if self.stop_var:
-                    break
+        try:
+            while not self.stop_var:
+                try:
+                    # time.sleep(0.1)  # Simulate long running process
+                    line, recv_ts = self.obd.read()
+                    if self.stop_var:
+                        break
 
-                if not line:
-                    # End of file reached
+                    if not line:
+                        if not self.obd.serial:
+                            self.end_time = time.perf_counter()
+                            self.print_performance_stats()
+                            break
+                        continue
+
+                    if not line.strip():
+                        continue
+
+                    # Count and queue the message
+                    self.message_count += 1
+                    self.queue.put((line, recv_ts, self.obd.serial))
+                except Exception as e:
+                    print(f"Exception in file reading thread: {e}")
                     self.end_time = time.perf_counter()
                     self.print_performance_stats()
                     break
-                    
-                # Count and queue the message
-                self.message_count += 1
-                self.queue.put(line)
-            except Exception as e:
-                print(f"Exception in file reading thread: {e}")
-                self.end_time = time.perf_counter()
-                self.print_performance_stats()
-                break
-        
-        self.obd.close()
+        finally:
+            if self.obd is not None:
+                try:
+                    self.obd.close()
+                except Exception:
+                    pass
+                self.obd = None
 
     def stop(self):
         self.stop_var = True
@@ -1887,16 +2116,19 @@ class Application(tk.Frame):
         # Create ToolManager to handle OBD device state
         self.tool_manager = ToolManager(self.queue, status_callback=self.update_obd_status)
         self._last_send_selection = None
+        self._serial_rx_window = deque()
         self.initialize_user_interface()
-        self.update_status_bar(False)
         self.mm = MessageManager(self)
+        self.message_queue_store = MessageQueueStore()
+        self._message_queue_toplevel = None
+        self.update_status_bar(0)
         # Start the queue processing
         self.update_ui()
         if self._initial_open:
             self.root.after_idle(self._apply_initial_open)
 
     def _apply_initial_open(self):
-        """CLI: pre-fill OBD Device field and run Read (serial port or log file path)."""
+        """CLI: pre-fill OBD Device field and run Read/Open (serial port or log file path)."""
         self.serial_port_entry.delete(0, tk.END)
         self.serial_port_entry.insert(0, self._initial_open)
         self.read_file()
@@ -1917,11 +2149,13 @@ class Application(tk.Frame):
         
         ''' Variables for GUI '''
         self.statusBarString = tk.StringVar()
+        self.statusBarRxStatsString = tk.StringVar()
         self.statusBarOBDString = tk.StringVar()
         self.messageTreeLock = tk.BooleanVar()
         self.hideHeartbeats = tk.BooleanVar(master=self.root, value=True)
         self.hideHeartbeatsEverywhere = tk.BooleanVar(master=self.root, value=True)
-        self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=False)
+        self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=True)
+        self.decodeAsciiPayloadView = tk.BooleanVar(master=self.root, value=False)
         self.messageUniqueByte = tk.StringVar()
         self.messageUniqueByte.set("2")
         
@@ -1984,35 +2218,40 @@ class Application(tk.Frame):
         self.messageTree_checkbox.grid(row=2,column=0, sticky=tk.E)
         
         # Set the treeview for the raw transaction table
-        self.messageTree = ttk.Treeview(self.root, columns=('Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload', 'Data', 'Description'))
+        self.messageTree = ttk.Treeview(
+            self.root,
+            columns=("Time", "Hdr", "Prio", "Mode", "Type", "TA", "SA", "Payload", "Data", "Description"),
+        )
         self.messageTreeScroll = ttk.Scrollbar(self.root)
         self.messageTreeScroll.configure(command=self.messageTree.yview)
         self.messageTree.configure(yscrollcommand=self.messageTreeScroll.set)
         
         # Set the heading (Attribute Names)
-        self.messageTree.heading('#0', text='MID')
-        self.messageTree.heading('#1', text='Hdr')
-        self.messageTree.heading('#2', text='Priority')
-        self.messageTree.heading('#3', text='Mode')
-        self.messageTree.heading('#4', text='Type')
-        self.messageTree.heading('#5', text='TA')
-        self.messageTree.heading('#6', text='SA')
-        self.messageTree.heading('#7', text='Payload')
-        self.messageTree.heading('#8', text='Data')
-        self.messageTree.heading('#9', text='Description')
+        self.messageTree.heading("#0", text="MID")
+        self.messageTree.heading("#1", text="Time (s)")
+        self.messageTree.heading("#2", text="Hdr")
+        self.messageTree.heading("#3", text="Priority")
+        self.messageTree.heading("#4", text="Mode")
+        self.messageTree.heading("#5", text="Type")
+        self.messageTree.heading("#6", text="TA")
+        self.messageTree.heading("#7", text="SA")
+        self.messageTree.heading("#8", text="Payload")
+        self.messageTree.heading("#9", text="Data")
+        self.messageTree.heading("#10", text="Description")
         
  
         # Specify attributes of the columns (We want to stretch it!)
-        self.messageTree.column('#0', minwidth=30, width=40, stretch=tk.YES)
-        self.messageTree.column('#1', minwidth=30, width=30, stretch=tk.YES)
-        self.messageTree.column('#2', minwidth=40, width=40, stretch=tk.YES)
-        self.messageTree.column('#3', minwidth=30, width=30, stretch=tk.YES)
-        self.messageTree.column('#4', minwidth=30, width=60, stretch=tk.YES)
-        self.messageTree.column('#5', minwidth=30, width=170, stretch=tk.YES)
-        self.messageTree.column('#6', minwidth=30, width=80, stretch=tk.YES)
-        self.messageTree.column('#7', minwidth=50, width=200, stretch=tk.YES)
-        self.messageTree.column('#8', minwidth=50, width=100, stretch=tk.YES)
-        self.messageTree.column('#9', minwidth=50, width=300, stretch=tk.YES)
+        self.messageTree.column("#0", minwidth=30, width=40, stretch=tk.YES)
+        self.messageTree.column("#1", minwidth=52, width=64, stretch=tk.NO)
+        self.messageTree.column("#2", minwidth=30, width=30, stretch=tk.YES)
+        self.messageTree.column("#3", minwidth=40, width=40, stretch=tk.YES)
+        self.messageTree.column("#4", minwidth=30, width=30, stretch=tk.YES)
+        self.messageTree.column("#5", minwidth=30, width=60, stretch=tk.YES)
+        self.messageTree.column("#6", minwidth=30, width=170, stretch=tk.YES)
+        self.messageTree.column("#7", minwidth=30, width=80, stretch=tk.YES)
+        self.messageTree.column("#8", minwidth=50, width=200, stretch=tk.YES)
+        self.messageTree.column("#9", minwidth=50, width=100, stretch=tk.YES)
+        self.messageTree.column("#10", minwidth=50, width=300, stretch=tk.YES)
  
         self.messageTree.grid(row=3, column=0, sticky='nsew')
         self.messageTreeScroll.grid(row=3, column=1, sticky='nsw')
@@ -2028,6 +2267,9 @@ class Application(tk.Frame):
         self.messageTree.bind("<<TreeviewSelect>>", self._on_summary_or_message_tree_select)
         self.summaryTree.bind("<space>", self._on_trees_space_send_selected)
         self.messageTree.bind("<space>", self._on_trees_space_send_selected)
+        for seq in ("<Button-2>", "<Button-3>"):
+            self.summaryTree.bind(seq, self._on_summary_tree_context_menu)
+            self.messageTree.bind(seq, self._on_message_tree_context_menu)
         
         ''' Configuration Frame '''
         self.config_frame = tk.Frame(self.root, borderwidth = 1)
@@ -2039,7 +2281,7 @@ class Application(tk.Frame):
         self.config_label.grid(row=0, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
         config_sep.grid(row=1, columnspan = 3, sticky='ew')
-        self.serial_label = tk.Label(self.config_frame, text="OBD Device Serial Port")
+        self.serial_label = tk.Label(self.config_frame, text="OBD Dev Path/Log File")
         self.serial_port_entry = tk.Entry(self.config_frame)
         self.serial_browse_button = tk.Button(self.config_frame, text="Browse", command=self.browse_file)
         self.serial_label.grid(row=2, column=0, sticky=tk.W)
@@ -2060,13 +2302,15 @@ class Application(tk.Frame):
         self.idnumber_entry.bind('<Control-A>', self.select_all_text)
  
  
+        self.close_port_button = tk.Button(self.config_frame, text="Close port", command=self.close_serial_connection)
+        self.close_port_button.grid(row=4, column=0, sticky=tk.W)
         self.submit_button = tk.Button(self.config_frame, text="Parse", command=self.insert_data)
         self.submit_button.grid(row=4, column=1, sticky=tk.W)
-        self.read_button = tk.Button(self.config_frame, text="Read", command=self.read_file)
+        self.read_button = tk.Button(self.config_frame, text="Read/Open", command=self.read_file)
         self.read_button.grid(row=4, column=2, sticky=tk.W)
  
  
-        # View settings (own rows so they do not overlap Parse/Read)
+        # View settings (own rows so they do not overlap Parse / Read/Open)
         self.view_settings_label = tk.Label(self.config_frame, text="View Settings")
         self.view_settings_label.grid(row=5, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
@@ -2081,7 +2325,17 @@ class Application(tk.Frame):
         self.view_uniqueByte_label.grid(row=9, column=0, sticky=tk.W)
         self.view_uniqueByte = tk.OptionMenu(self.config_frame, self.messageUniqueByte, "0", "1", "2", "All")
         self.view_uniqueByte.grid(row=9, column=1, sticky=tk.W)
-        
+
+        self.view_decode_ascii_payload = tk.Checkbutton(
+            self.config_frame,
+            text="Try to decode ASCII in payload column",
+            variable=self.decodeAsciiPayloadView,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.view_decode_ascii_payload.grid(row=10, column=0, columnspan=3, sticky=tk.W)
+        self.decodeAsciiPayloadView.trace_add("write", lambda *_: self._refresh_payload_column_display())
+
         self.delete_button = tk.Button(self.config_frame, text="Clear Message Logs", command=self.delete_data)
         self.delete_button.grid(row=100, column=0, sticky=tk.W)
         
@@ -2145,40 +2399,115 @@ class Application(tk.Frame):
         
         self.help_button = tk.Button(self.transmit_frame, text="Help", command=self.show_help)
         self.help_button.grid(row=100, column=1, sticky='s')
+
+        self.message_queues_button = tk.Button(
+            self.transmit_frame,
+            text="Message queues…",
+            command=self.open_message_queue_window,
+        )
+        self.message_queues_button.grid(row=99, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         
         self.exit_button = tk.Button(self.transmit_frame, text="Exit Program", command=self.on_app_close)
         self.exit_button.grid(row=100, column=0, sticky='s')
         
     
         
-        ''' Status Bar '''
-        self.statusBar = tk.Label(self.root, textvariable=self.statusBarString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.statusBar.grid(row=4, column=0, columnspan=5, sticky='nsew')
+        ''' Status Bar (message count + optional live stats in separate labels so rates do not shift the count) '''
+        self.status_bar_frame = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
+        # Only columns 0–1: the OBD label is gridded from column 2 onward. If we columnspan=5 here, it sits
+        # underneath the OBD widget and the throughput text is never visible.
+        self.status_bar_frame.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        # Fixed-width message column so growing digit counts do not push the throughput label sideways.
+        self.status_bar_frame.columnconfigure(0, weight=0, minsize=200)
+        self.status_bar_frame.columnconfigure(1, weight=1)
+        self.statusBar = tk.Label(
+            self.status_bar_frame,
+            textvariable=self.statusBarString,
+            anchor=tk.W,
+            width=26,
+            padx=4,
+            pady=1,
+        )
+        self.statusBar.grid(row=0, column=0, sticky="nw")
+        self.statusBarRxStats = tk.Label(
+            self.status_bar_frame,
+            textvariable=self.statusBarRxStatsString,
+            anchor=tk.W,
+            padx=4,
+            pady=1,
+        )
+        self.statusBarRxStats.grid(row=0, column=1, sticky="nw", padx=(8, 4))
         self.statusBarOBD = tk.Label(self.root, textvariable=self.statusBarOBDString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.statusBarOBD.grid(row=4, column=2, columnspan=5, sticky='nsew')
+        self.statusBarOBD.grid(row=4, column=2, columnspan=3, sticky="nsew")
         
         
         ''' Reset any variables '''
         self.sid = 0
         self.mid = 0
         self.statusBarString.set("Messages: 0")
+        self.statusBarRxStatsString.set("")
         self.statusBarOBDString.set("OBD: Disconnected")
  
  
-    def update_status_bar(self, messages=0, connected=False):
-        string = "Messages: " + str(messages)
-            
-        self.statusBarString.set(string)
+    def record_serial_rx_sample(self, bus_byte_count):
+        """Track live serial VPW frames for rolling bus throughput (VPW bytes, not ASCII wire bytes)."""
+        if not self.tool_manager.is_connected:
+            return
+        obd = self.tool_manager.obd
+        if obd is None or not obd.serial:
+            return
+        now = time.perf_counter()
+        self._serial_rx_window.append((now, int(bus_byte_count)))
+        self._trim_serial_rx_window(now)
+
+    def _trim_serial_rx_window(self, now=None):
+        now = now if now is not None else time.perf_counter()
+        cutoff = now - 3.0
+        while self._serial_rx_window and self._serial_rx_window[0][0] < cutoff:
+            self._serial_rx_window.popleft()
+
+    def _serial_rx_stats_fragment(self):
+        """Rolling ~3 s average msg/s and raw VPW bus kbps (kilobits/s); empty when not on serial."""
+        obd = getattr(self.tool_manager, "obd", None)
+        if not self.tool_manager.is_connected or obd is None or not obd.serial:
+            return ""
+        now = time.perf_counter()
+        self._trim_serial_rx_window(now)
+        if not self._serial_rx_window:
+            return "0.0 msg/s, 0.00 kbps (bus)"
+        oldest = self._serial_rx_window[0][0]
+        # Average over actual span in the window (≤3 s), with a small floor to avoid spikes when
+        # several frames share the same perf_counter sample.
+        span = min(max(now - oldest, 0.05), 3.0)
+        n = len(self._serial_rx_window)
+        nbytes = sum(b for _, b in self._serial_rx_window)
+        msg_per_sec = n / span
+        kbps = (nbytes * 8.0) / (span * 1000.0)
+        return f"{msg_per_sec:.1f} msg/s, {kbps:.2f} kbps (bus)"
+
+    def update_status_bar(self, messages=None, connected=False):
+        if messages is None:
+            mm = getattr(self, "mm", None)
+            messages = len(mm.messageHistory) if mm else 0
+        self.statusBarString.set("Messages: " + str(messages))
+        self.statusBarRxStatsString.set(self._serial_rx_stats_fragment())
 
     def update_message_count(self, messages=0):
         self.messages_receieved = messages
         
 
-    def update_obd_status(self,connected=False,dev_version=""):
+    def update_obd_status(self, connected=False, dev_version=""):
+        # ToolManager invokes this from the reader thread on connect; Tk is main-thread only.
+        if threading.current_thread() is not threading.main_thread():
+            self.root.after(0, lambda c=connected, d=dev_version: self.update_obd_status(c, d))
+            return
+        if not connected:
+            self._serial_rx_window.clear()
         if connected:
             self.statusBarOBDString.set("OBD: Connected - " + str(dev_version))
         else:
             self.statusBarOBDString.set(str("OBD: Disconnected"))
+        self.update_status_bar()
     
     def browse_file(self):
         """Open file dialog to select a VPW log file"""
@@ -2198,28 +2527,104 @@ class Application(tk.Frame):
         rawString = self.idnumber_entry.get()
         self.mm.new_message(rawString)
         
+    def _history_has_any_timestamps(self):
+        mm = getattr(self, "mm", None)
+        if mm is None:
+            return False
+        for row in mm.messageHistory:
+            if len(row) > 11 and row[11] is not None:
+                return True
+        return False
+
     def export_log(self):
-        """Export logs to a user-selected file"""
-        file_path = filedialog.asksaveasfilename(
-            title="Export VPW Logs",
-            defaultextension=".txt",
-            filetypes=[
-                ("Text files", "*.txt"),
-                ("Log files", "*.log"),
-                ("All files", "*.*")
-            ],
-            initialfile="export.txt"
+        """Export logs: path + optional line-leading timestamps (dialog)."""
+        if not self.mm.messageHistory:
+            messagebox.showinfo("Export", "No messages to export.", parent=self.root)
+            return
+        has_ts = self._history_has_any_timestamps()
+        dlg = tk.Toplevel(self.root)
+        dlg.title("Export VPW Logs")
+        dlg.transient(self.root)
+        dlg.resizable(True, False)
+
+        path_var = tk.StringVar(value="export.txt")
+        include_ts = tk.BooleanVar(value=has_ts)
+
+        outer = ttk.Frame(dlg, padding=10)
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(outer, text="File:").grid(row=0, column=0, sticky=tk.W)
+        ent = ttk.Entry(outer, textvariable=path_var, width=52)
+        ent.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(2, 6))
+
+        def browse():
+            p = filedialog.asksaveasfilename(
+                parent=dlg,
+                title="Export VPW Logs",
+                defaultextension=".txt",
+                filetypes=[
+                    ("Text files", "*.txt"),
+                    ("Log files", "*.log"),
+                    ("All files", "*.*"),
+                ],
+                initialfile=path_var.get().strip() or "export.txt",
+            )
+            if p:
+                path_var.set(p)
+
+        ttk.Button(outer, text="Browse…", command=browse).grid(row=1, column=2, padx=(6, 0), pady=(2, 6))
+
+        chk = ttk.Checkbutton(
+            outer,
+            text="Include relative timestamps (0.000 s) at the start of each line",
+            variable=include_ts,
         )
-        
-        if file_path:
+        chk.grid(row=2, column=0, columnspan=3, sticky=tk.W)
+        if not has_ts:
+            include_ts.set(False)
+            chk.state(["disabled"])
+
+        err_lbl = ttk.Label(outer, text="", foreground="#a00")
+        err_lbl.grid(row=3, column=0, columnspan=3, sticky=tk.W, pady=(4, 0))
+
+        btn_row = ttk.Frame(outer)
+        btn_row.grid(row=4, column=0, columnspan=3, pady=(10, 0))
+
+        def do_export():
+            file_path = path_var.get().strip()
+            if not file_path:
+                err_lbl.config(text="Choose a file path.")
+                return
+            want_ts = bool(include_ts.get()) and has_ts
             try:
-                with open(file_path, "w") as fexport:
-                    for line in self.mm.messageHistory:
-                        fexport.write(line[8] + "\r\n")  # line[8] is the raw hex data stream (inString)
+                with open(file_path, "w", encoding="utf-8", newline="") as fexport:
+                    for row in self.mm.messageHistory:
+                        raw = row[8]
+                        ts = row[11] if len(row) > 11 else None
+                        if want_ts and ts is not None:
+                            fexport.write(_format_vpw_export_timestamp(ts) + " " + raw + "\r\n")
+                        else:
+                            fexport.write(raw + "\r\n")
                 print(f"Logs exported successfully to: {file_path}")
+                dlg.destroy()
             except Exception as e:
-                print(f"Error exporting logs: {e}")
-                messagebox.showerror("Export Error", f"Failed to export logs:\n{e}")
+                err_lbl.config(text=str(e))
+
+        ttk.Button(btn_row, text="Export", command=do_export).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT)
+
+        outer.columnconfigure(0, weight=1)
+        dlg.grab_set()
+        ent.focus_set()
+
+    def _current_recv_timestamp_for_transmit_echo(self):
+        obd = getattr(self.tool_manager, "obd", None)
+        if obd is None or not obd.serial:
+            return None
+        t0 = getattr(obd, "_vpw_capture_t0", None)
+        if t0 is None:
+            return None
+        return time.perf_counter() - t0
         
 
     def new_message(self, newMsg, tags=()):
@@ -2229,17 +2634,7 @@ class Application(tk.Frame):
             "end",
             iid=newMsg[0],
             text=str(newMsg[0]),
-            values=(
-                "{:02X}".format(newMsg[1]),
-                newMsg[4],
-                newMsg[5],
-                newMsg[6],
-                newMsg[2],
-                newMsg[3],
-                _vpw_payload_hex_for_display(newMsg[7]),
-                newMsg[9],
-                newMsg[10],
-            ),
+            values=self._message_history_tree_values_tuple(newMsg),
             tags=tags,
         )
 
@@ -2253,22 +2648,82 @@ class Application(tk.Frame):
         
     def new_message_summary(self, newMsg):        
         # Print the message to the message history tree
-        self.summaryTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
-                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
-                             newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
+        self.summaryTree.insert(
+            "",
+            "end",
+            iid=newMsg[0],
+            text=str(newMsg[0]),
+            values=self._summary_tree_values_tuple(newMsg),
+        )
         #self.sid = self.sid + 1
         
         
     def update_message_summary(self, index, newMsg):
         try:
-            self.summaryTree.item(index, text=str(index),
-                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
+            self.summaryTree.item(
+                index,
+                text=str(index),
+                values=self._summary_tree_values_tuple(newMsg),
+            )
         except ValueError:
             print ("Issue updating index, ", newMsg)
             for child in self.summaryTree.get_children():
                 print(self.summaryTree.item(child)["values"])
-    
-    
+
+    def _message_history_tree_values_tuple(self, hist_row):
+        try_ascii = self.decodeAsciiPayloadView.get()
+        pl = _vpw_payload_column_text(hist_row[7], try_ascii)
+        ts = hist_row[11] if len(hist_row) > 11 else None
+        ts_txt = _format_vpw_export_timestamp(ts) if ts is not None else ""
+        return (
+            ts_txt,
+            "{:02X}".format(hist_row[1]),
+            hist_row[4],
+            hist_row[5],
+            hist_row[6],
+            hist_row[2],
+            hist_row[3],
+            pl,
+            hist_row[9],
+            hist_row[10],
+        )
+
+    def _summary_tree_values_tuple(self, sum_row):
+        try_ascii = self.decodeAsciiPayloadView.get()
+        pl = _vpw_payload_column_text(sum_row[9], try_ascii)
+        return (
+            sum_row[2],
+            sum_row[1],
+            "{:02X}".format(sum_row[3]),
+            sum_row[6],
+            sum_row[7],
+            sum_row[8],
+            sum_row[4],
+            sum_row[5],
+            pl,
+            sum_row[10],
+            sum_row[11],
+        )
+
+    def _refresh_payload_column_display(self):
+        mm = getattr(self, "mm", None)
+        if mm is None:
+            return
+        try:
+            for iid in self.messageTree.get_children():
+                idx = int(iid)
+                row = mm.messageHistory[idx]
+                self.messageTree.item(iid, values=self._message_history_tree_values_tuple(row))
+        except (ValueError, IndexError, tk.TclError):
+            pass
+        try:
+            for iid in self.summaryTree.get_children():
+                idx = int(iid)
+                row = mm.messageSummary[idx]
+                self.summaryTree.item(iid, values=self._summary_tree_values_tuple(row))
+        except (ValueError, IndexError, tk.TclError):
+            pass
+
     def delete_data(self):
         #row_id = int(self.summaryTree.focus())
         #self.summaryTreeview.delete(row_id)
@@ -2281,14 +2736,23 @@ class Application(tk.Frame):
         self._last_send_selection = None
             
         self.mm = MessageManager(self)
-            
+        self._serial_rx_window.clear()
+        obd = getattr(self.tool_manager, "obd", None)
+        if self.tool_manager.is_connected and obd is not None:
+            obd.reset_vpw_capture_epoch()
+
         self.mid = 0
         self.sid = 0
-        
+        self.update_status_bar(0)
+
     def read_file(self):
         file_path = self.serial_port_entry.get()
         # Use ToolManager to handle connection
         self.tool_manager.connect(file_path)
+
+    def close_serial_connection(self):
+        """Stop the reading thread and close the serial port (or file handle) cleanly."""
+        self.tool_manager.disconnect()
 
     def _clear_last_send_row_highlight(self):
         if not self._last_send_selection:
@@ -2330,12 +2794,17 @@ class Application(tk.Frame):
         if not self.showTransmittedFrames.get():
             return
         line = f"{hdr} {pl}".strip()
-        self.mm.new_message(line, skip_summary=True, transmit_echo=True)
+        self.mm.new_message(
+            line,
+            skip_summary=True,
+            transmit_echo=True,
+            recv_rel_sec=self._current_recv_timestamp_for_transmit_echo(),
+        )
 
     def on_transmit_send(self):
         """Send Header + Payload using DVI (OBDX) or ELM/STN path."""
         if not self.tool_manager.is_connected:
-            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            messagebox.showwarning("Not connected", "Open a serial device with Read/Open first.")
             return
         if not self.tool_manager.obd or not self.tool_manager.obd.serial:
             messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
@@ -2361,7 +2830,7 @@ class Application(tk.Frame):
     def on_transmit_send_selected(self):
         """Send the last single-clicked row from Summary or Message history (see highlight)."""
         if not self.tool_manager.is_connected:
-            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            messagebox.showwarning("Not connected", "Open a serial device with Read/Open first.")
             return
         if not self.tool_manager.obd or not self.tool_manager.obd.serial:
             messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
@@ -2374,13 +2843,12 @@ class Application(tk.Frame):
             return
         tree, iid = self._last_send_selection
         try:
-            vals = tree.item(iid, "values")
+            tree.item(iid, "values")
         except tk.TclError:
             self._last_send_selection = None
             messagebox.showwarning("Send target", "That row no longer exists. Click another message.")
             return
-        is_summary = tree is self.summaryTree
-        pair = self._header_payload_from_values(vals, is_summary)
+        pair = self._header_payload_from_tree(tree, iid)
         if not pair:
             messagebox.showerror("Send target", "Could not build a frame from the selected row.")
             return
@@ -2406,11 +2874,22 @@ class Application(tk.Frame):
         # Process any messages in the queue
         try:
             while True:
-                line = self.queue.get_nowait()
-                self.mm.new_message(line)
+                item = self.queue.get_nowait()
+                if isinstance(item, tuple) and len(item) == 3:
+                    line, recv_ts, live_serial = item
+                elif isinstance(item, tuple) and len(item) == 2:
+                    line, recv_ts = item
+                    live_serial = False
+                else:
+                    line, recv_ts, live_serial = item, None, False
+                self.mm.new_message(line, recv_rel_sec=recv_ts, live_serial_rx=live_serial)
         except queue.Empty:
             pass
-        
+
+        # Always refresh from the UI thread so stats reappear after reconnect (Tk StringVars are not
+        # safe to update from the reader thread; see update_obd_status).
+        self.update_status_bar()
+
         # Schedule the next update
         self.root.after(100, self.update_ui)
     
@@ -2423,41 +2902,51 @@ class Application(tk.Frame):
         """Handle double-click on summary tree to populate transmit frame"""
         item = self.summaryTree.selection()[0] if self.summaryTree.selection() else None
         if item:
-            values = self.summaryTree.item(item, 'values')
-            self.populate_transmit_frame(values, is_summary=True)
+            self.populate_transmit_frame(self.summaryTree, item)
     
     def on_message_double_click(self, event):
         """Handle double-click on message tree to populate transmit frame"""
         item = self.messageTree.selection()[0] if self.messageTree.selection() else None
         if item:
-            values = self.messageTree.item(item, 'values')
-            self.populate_transmit_frame(values, is_summary=False)
-    
-    def _header_payload_from_values(self, values, is_summary):
-        """Build transmit header + payload hex strings from a tree row's column values."""
+            self.populate_transmit_frame(self.messageTree, item)
+
+    def _header_payload_from_tree(self, tree, iid):
+        """Build transmit header + payload hex from tree row (payload always from stored bytes)."""
+        is_summary = tree is self.summaryTree
+        try:
+            vals = tree.item(iid, "values")
+            idx = int(iid)
+        except (tk.TclError, ValueError, TypeError):
+            return None
         try:
             if is_summary:
-                if len(values) < 10:
+                if idx < 0 or idx >= len(self.mm.messageSummary) or len(vals) < 10:
                     return None
-                hdr, ta, sa, payload = values[2], values[6], values[7], values[8]
+                raw_pl = self.mm.messageSummary[idx][9]
+                hdr, ta, sa = vals[2], vals[6], vals[7]
             else:
-                if len(values) < 8:
+                if idx < 0 or idx >= len(self.mm.messageHistory) or len(vals) < 7:
                     return None
-                hdr, ta, sa, payload = values[0], values[4], values[5], values[6]
+                raw_pl = self.mm.messageHistory[idx][7]
+                hdr, ta, sa = vals[1], vals[5], vals[6]
+        except (IndexError, TypeError):
+            return None
+        try:
             ta_hex = self.extract_hex_from_column(ta)
             sa_hex = self.extract_hex_from_column(sa)
             if ta_hex and sa_hex:
                 header = f"{hdr} {ta_hex} {sa_hex}"
             else:
                 header = str(hdr)
-            return (header.strip(), str(payload).strip())
-        except (IndexError, TypeError, ValueError):
+            pl = _vpw_payload_hex_for_transmit(raw_pl)
+            return (header.strip(), pl.strip())
+        except (TypeError, ValueError):
             return None
 
-    def populate_transmit_frame(self, values, is_summary=False):
+    def populate_transmit_frame(self, tree, item):
         """Populate transmit frame fields with data from selected row"""
         try:
-            pair = self._header_payload_from_values(values, is_summary)
+            pair = self._header_payload_from_tree(tree, item)
             if not pair:
                 print("Error: Not enough columns or bad data in tree row")
                 return
@@ -2512,10 +3001,82 @@ class Application(tk.Frame):
         close_button = tk.Button(help_window, text="Close", command=help_window.destroy)
         close_button.pack(pady=10)
 
+    def open_message_queue_window(self):
+        open_or_raise_message_queue_window(self)
+
+    def _on_summary_tree_context_menu(self, event):
+        self._tree_context_menu(event, self.summaryTree, is_summary=True)
+
+    def _on_message_tree_context_menu(self, event):
+        self._tree_context_menu(event, self.messageTree, is_summary=False)
+
+    def _tree_context_menu(self, event, tree, is_summary):
+        row = tree.identify_row(event.y)
+        if not row:
+            return
+        tree.selection_set(row)
+        self._set_last_send_row_highlight(tree, row)
+        try:
+            vals = tree.item(row, "values")
+        except tk.TclError:
+            return
+        pair = self._header_payload_from_tree(tree, row)
+        if not pair:
+            return
+        hdr, pl = pair
+        desc = description_from_tree_values(vals, is_summary)
+        menu = tk.Menu(self.root, tearoff=0)
+        sub = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="Add to queue", menu=sub)
+        sub.add_command(
+            label="New queue…",
+            command=lambda h=hdr, p=pl, d=desc: self._context_add_message_new_queue(h, p, d),
+        )
+        if self.message_queue_store.groups:
+            sub.add_separator()
+            for i, g in enumerate(self.message_queue_store.groups):
+                label = g["name"]
+                if len(label) > 52:
+                    label = label[:49] + "…"
+                sub.add_command(
+                    label=label,
+                    command=lambda idx=i, h=hdr, p=pl, d=desc: self._context_append_message_to_queue(idx, h, p, d),
+                )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _context_add_message_new_queue(self, hdr, pl, desc):
+        name = simpledialog.askstring("New queue", "Queue name:", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        idx = self.message_queue_store.add_group(name)
+        self.message_queue_store.append_message(idx, hdr, pl, desc)
+        self._refresh_message_queue_window_if_open()
+
+    def _context_append_message_to_queue(self, group_index, hdr, pl, desc):
+        self.message_queue_store.append_message(group_index, hdr, pl, desc)
+        self._refresh_message_queue_window_if_open()
+
+    def _refresh_message_queue_window_if_open(self):
+        mq = getattr(self, "_message_queue_toplevel", None)
+        if mq is None:
+            return
+        try:
+            if mq.win.winfo_exists():
+                mq.refresh_preserve_selection()
+        except tk.TclError:
+            pass
+
     def on_app_close(self):
         if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
             # Disconnect via ToolManager
             self.tool_manager.disconnect()
+            destroy_message_queue_window_if_any(self)
             self.root.destroy()
 
 
