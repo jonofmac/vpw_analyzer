@@ -23,7 +23,14 @@ Changes
 from logging import exception
 from enum import Enum
 import tkinter as tk
-from tkinter import messagebox, filedialog
+from tkinter import messagebox, filedialog, simpledialog
+
+from message_queue_window import (
+    MessageQueueStore,
+    description_from_tree_values,
+    destroy_message_queue_window_if_any,
+    open_or_raise_message_queue_window,
+)
 import tkinter.ttk as ttk
 import queue
 import sys
@@ -98,6 +105,7 @@ Tips & Tricks:
 • Adjust "Compare First # Bytes" to control how messages are grouped in the summary table
 • Click once on a row in Summary or Message history to mark it (highlight) for "Send Selected Message"; double-click still fills the transmit fields only
 • With focus in Summary or Message history, Space triggers Send Selected Message (same as the button)
+• Right-click a row in Summary or Message history: Add to queue (new queue or append to an existing one). Open Message queues from the transmit panel to reorder messages, double-click Header/Payload/Description to edit (Enter saves, Esc cancels), Export/Import JSON, or send an entire queue in order; use Load into transmit to copy the selected row to the transmit fields
 • Enable "Show transmitted frames in message history" to append each successful send as a green-tagged row with a [TX] description prefix
 
 VPW Protocol Primer
@@ -1890,6 +1898,8 @@ class Application(tk.Frame):
         self.initialize_user_interface()
         self.update_status_bar(False)
         self.mm = MessageManager(self)
+        self.message_queue_store = MessageQueueStore()
+        self._message_queue_toplevel = None
         # Start the queue processing
         self.update_ui()
         if self._initial_open:
@@ -2028,6 +2038,9 @@ class Application(tk.Frame):
         self.messageTree.bind("<<TreeviewSelect>>", self._on_summary_or_message_tree_select)
         self.summaryTree.bind("<space>", self._on_trees_space_send_selected)
         self.messageTree.bind("<space>", self._on_trees_space_send_selected)
+        for seq in ("<Button-2>", "<Button-3>"):
+            self.summaryTree.bind(seq, self._on_summary_tree_context_menu)
+            self.messageTree.bind(seq, self._on_message_tree_context_menu)
         
         ''' Configuration Frame '''
         self.config_frame = tk.Frame(self.root, borderwidth = 1)
@@ -2145,6 +2158,13 @@ class Application(tk.Frame):
         
         self.help_button = tk.Button(self.transmit_frame, text="Help", command=self.show_help)
         self.help_button.grid(row=100, column=1, sticky='s')
+
+        self.message_queues_button = tk.Button(
+            self.transmit_frame,
+            text="Message queues…",
+            command=self.open_message_queue_window,
+        )
+        self.message_queues_button.grid(row=99, column=0, columnspan=2, sticky=tk.W, pady=(6, 0))
         
         self.exit_button = tk.Button(self.transmit_frame, text="Exit Program", command=self.on_app_close)
         self.exit_button.grid(row=100, column=0, sticky='s')
@@ -2512,10 +2532,82 @@ class Application(tk.Frame):
         close_button = tk.Button(help_window, text="Close", command=help_window.destroy)
         close_button.pack(pady=10)
 
+    def open_message_queue_window(self):
+        open_or_raise_message_queue_window(self)
+
+    def _on_summary_tree_context_menu(self, event):
+        self._tree_context_menu(event, self.summaryTree, is_summary=True)
+
+    def _on_message_tree_context_menu(self, event):
+        self._tree_context_menu(event, self.messageTree, is_summary=False)
+
+    def _tree_context_menu(self, event, tree, is_summary):
+        row = tree.identify_row(event.y)
+        if not row:
+            return
+        tree.selection_set(row)
+        self._set_last_send_row_highlight(tree, row)
+        try:
+            vals = tree.item(row, "values")
+        except tk.TclError:
+            return
+        pair = self._header_payload_from_values(vals, is_summary)
+        if not pair:
+            return
+        hdr, pl = pair
+        desc = description_from_tree_values(vals, is_summary)
+        menu = tk.Menu(self.root, tearoff=0)
+        sub = tk.Menu(menu, tearoff=0)
+        menu.add_cascade(label="Add to queue", menu=sub)
+        sub.add_command(
+            label="New queue…",
+            command=lambda h=hdr, p=pl, d=desc: self._context_add_message_new_queue(h, p, d),
+        )
+        if self.message_queue_store.groups:
+            sub.add_separator()
+            for i, g in enumerate(self.message_queue_store.groups):
+                label = g["name"]
+                if len(label) > 52:
+                    label = label[:49] + "…"
+                sub.add_command(
+                    label=label,
+                    command=lambda idx=i, h=hdr, p=pl, d=desc: self._context_append_message_to_queue(idx, h, p, d),
+                )
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _context_add_message_new_queue(self, hdr, pl, desc):
+        name = simpledialog.askstring("New queue", "Queue name:", parent=self.root)
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        idx = self.message_queue_store.add_group(name)
+        self.message_queue_store.append_message(idx, hdr, pl, desc)
+        self._refresh_message_queue_window_if_open()
+
+    def _context_append_message_to_queue(self, group_index, hdr, pl, desc):
+        self.message_queue_store.append_message(group_index, hdr, pl, desc)
+        self._refresh_message_queue_window_if_open()
+
+    def _refresh_message_queue_window_if_open(self):
+        mq = getattr(self, "_message_queue_toplevel", None)
+        if mq is None:
+            return
+        try:
+            if mq.win.winfo_exists():
+                mq.refresh_preserve_selection()
+        except tk.TclError:
+            pass
+
     def on_app_close(self):
         if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
             # Disconnect via ToolManager
             self.tool_manager.disconnect()
+            destroy_message_queue_window_if_any(self)
             self.root.destroy()
 
 
