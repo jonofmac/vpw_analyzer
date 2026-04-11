@@ -9,7 +9,7 @@ Description: This is a utility that parses incoming messages from a VPW interfac
     the COM port number into the 'OBD Device Port' and press 'Read/Open'. If on Unix
     based system, type in the full path (/dev/serialTTY) and press 'Read/Open'.
 
-Version 0.4 - Apr 11, 2026
+Version 0.5 - Apr 11, 2026
 Changes
     - Added support for OBDX Pro VT
     - Added support for VPW log files
