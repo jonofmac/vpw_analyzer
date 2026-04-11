@@ -2,27 +2,405 @@
 VPW Analyzer
 By Jonathan Valdez
 
-Version 0.1 - Jan 25, 2022
+Version 0.3 - Feb 1, 2022
 Description: This is a utility that parses incoming messages from a VPW interface
     into a more human-readable format. The bottom box shows each message that was
     received in order. The top box shows unique messages that were received.
     It connects to an ELM327 like device via a serial port. If on Windows, type
     the COM port number into the 'OBD Device Port' and press 'Read'. If on Unix
     based system, type in the full path (/dev/serialTTY) and press 'Read'.
+
+Changes
+    - TBD
+
+
+Version 0.2 - Jan 26, 2022
+Changes
+    - Fixed crashing on exit
+    - Added some device response verification steps
+    - Query device string to get model and firmware info
 '''
 from logging import exception
+from enum import Enum
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, filedialog
 import tkinter.ttk as ttk
-import binascii
 import queue
+import sys
 import threading
 import time
-import pandas as pd
-import string
 import serial
-import sys
 import re
+
+
+# Short read timeout while probing ELM prompts (adapter stuck in DVI won't send '>')
+OBD_SERIAL_PROBE_TIMEOUT = 0.4
+OBD_SERIAL_RUNTIME_TIMEOUT = 3.0
+
+
+def _dvi_checksum(body_without_chk):
+    """OBDX DVI checksum: bitwise NOT of (sum of preceding bytes mod 256)."""
+    return ((~sum(body_without_chk)) & 0xFF)
+
+
+def _dvi_pack(cmd, data):
+    """Build a normal DVI frame: cmd, len(data), data..., checksum (cmd 0x08–0x11 style)."""
+    data = bytes(data)
+    if len(data) > 255:
+        raise ValueError("payload too long for normal DVI frame; use large-frame command")
+    body = bytes([cmd, len(data)]) + data
+    return body + bytes([_dvi_checksum(body)])
+
+
+def _dvi_reboot_to_boot_frame():
+    """§3.10.1 Software reboot — returns adapter to ELM default after boot."""
+    return bytes([0x25, 0x00, _dvi_checksum([0x25, 0x00])])
+
+
+def _vpw_payload_hex_for_display(payload_bytes):
+    """Format payload for Treeview; strip trailing CRC when present (ELM). DVI often has no CRC."""
+    if not payload_bytes:
+        return ""
+    if len(payload_bytes) == 1:
+        return "{:02X}".format(payload_bytes[0])
+    return " ".join("{:02X}".format(x) for x in payload_bytes[:-1])
+
+
+# Help text for the application
+HELP_TEXT = """VPW Analyzer Help
+==================
+
+HOW TO USE THE PROGRAM
+======================
+
+OBD Device Serial Port Field:
+• For serial communication: Enter the serial port path
+  - Linux: /dev/ttyUSB0, /dev/ttyACM0, etc.
+  - Windows: COM1, COM3, COM4, etc.
+• For file analysis: Enter the full path to a VPW log file
+  - Example: /home/user/vpw_log.txt
+  - Example: C:\\Users\\User\\Documents\\vpw_log.txt
+• Click "Read" to open the port/file and start parsing
+• From a terminal you can run: python vpw_analyzer.py <path> — the path is filled in and Read runs automatically
+
+Raw Line Input:
+• Manually enter VPW messages for parsing
+• Format: 3-byte header + data + checksum/CRC
+• Example: 8C F1 10 11 80 24 5A
+• Click "Parse" to process the message
+
+Tips & Tricks:
+==============
+• Double-click any message in the Summary or Message History tables to automatically populate the Transmit Frame with that message's header and payload
+• Use Ctrl+A in any text field to select all text
+• "Hide module heartbeats from summary table" (on by default) filters routine heartbeats out of the summary only (they still appear in message history unless the next option is on)
+• "Hide module heartbeats from everything" (on by default) also omits them from message history and export
+• Adjust "Compare First # Bytes" to control how messages are grouped in the summary table
+• Click once on a row in Summary or Message history to mark it (highlight) for "Send Selected Message"; double-click still fills the transmit fields only
+• With focus in Summary or Message history, Space triggers Send Selected Message (same as the button)
+• Enable "Show transmitted frames in message history" to append each successful send as a green-tagged row with a [TX] description prefix
+
+VPW Protocol Primer
+===================
+
+GM VPW Implementation Overview:
+GM's VPW (Variable Pulse Width) implementation uses a 3-byte header structure that includes the target address and source address (the module that sent the message).
+
+Addressing Modes:
+• Physical Address: Used for node-to-node communication (e.g., scan tool reading codes from a specific module)
+• Functional Address: Used for broadcast communication to multiple modules
+
+Message Types:
+The Mode column shows "F" for functional messages. Functional messages have several types:
+
+Command vs Status IDs:
+• Command IDs are always even numbers (e.g., $1A, $32, $48)
+• Status IDs are always the command ID + 1 (e.g., $1B, $33, $49)
+• Command = request/instruction, Status = response/confirmation
+
+Extended Address Messages:
+• "F Ext" in the Type column indicates Functional Extended Address
+• Provides additional location detail to functional messages
+• Examples: "front running lights only", "passenger door open"
+• Always includes a second data byte for location information
+
+Secondary IDs:
+• First data byte of any functional message is the Secondary ID
+• Provides "sub-fields" for the functional ID
+• Example: Engine RPM functional ID $1B (status) has:
+  - Secondary ID $02 = High resolution RPM
+  - Secondary ID $20 = Target idle speed
+  - Secondary ID $10 = Throttle position
+
+Extended Address Details:
+• If message type contains "F Ext", there will always be a second data byte
+• This byte provides physical location details for the secondary ID
+• Location byte varies depending on secondary ID and functional address used
+• Additional data bytes may follow for actual measurements
+
+Binary Flags:
+• Some secondary IDs are On/Off or Enabled/Disabled flags
+• Signaled by bit 7 (also called the Q-bit)of the secondary ID byte (first data byte)
+• Q-bit = 1: On/Enabled, Q-bit = 0: Off/Disabled
+
+Data Processing:
+• Additional data (like percentage readings) comes after the secondary ID
+• For F Ext messages: after secondary ID AND extended address
+• For regular F messages: after secondary ID only
+• PRD (Parameter Response Data) calculations convert raw bytes to meaningful values
+
+Message Structure Examples:
+==========================
+
+Regular Functional Message:
+Header: 8C F1 10
+Data:   11 80 24 5A
+• 8C = Priority/Header
+• F1 = Target Address (Functional)
+• 10 = Source Address (ECU)
+• 11 = Secondary ID
+• 80 = Data byte 1
+• 24 = Data byte 2
+• 5A = Checksum
+
+Extended Functional Message:
+Header: 8C F1 10
+Data:   11 22 80 24 5A
+• 8C = Priority/Header
+• F1 = Target Address (Functional)
+• 10 = Source Address (ECU)
+• 11 = Secondary ID
+• 22 = Extended Address (location detail)
+• 80 = Data byte 1
+• 24 = Data byte 2
+• 5A = Checksum
+
+For more detailed information about VPW protocol, refer to SAE J1850 and SAE J2178 standards.
+"""
+
+'''
+PRD (Parameter Response Data) class contains all data conversion methods
+for VPW message payloads according to SAE J2178 standards.
+'''
+class PRD:
+    """Parameter Response Data conversion methods for VPW messages"""
+    
+    # UNM (Unsigned Numeric) 8-bit methods
+    @staticmethod
+    def unm_08_15(payload):
+        """Convert 0-255 byte to 1/100 L per UNM-08-15"""
+        return (payload[0]) / 100 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_21(payload):
+        """Convert 0-255 byte to 1/6 per UNM-08-21"""
+        return (payload[0]) / 16 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_32(payload):
+        """Convert 0-255 byte to 1/16 per UNM-08-32"""
+        return (payload[0]) / 16 if len(payload) > 0 else 0
+    
+    @staticmethod
+    def unm_08_41(payload):
+        """Convert 0-255 byte to 1/10 per UNM-08-41"""
+        return (payload[0]) / 10 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_61(payload):
+        """Convert 0-255 byte to 0-100% per UNM-08-61"""
+        return (payload[0] * 100) / 255 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_71(payload):
+        """Convert 0-255 byte to 0-100% per UNM-08-71"""
+        return (payload[0] / 2) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_73(payload):
+        """Convert 0-255 byte to -40 to 87.5°C per UNM-08-73"""
+        return (payload[0] / 2) - 40 if len(payload) > 0 else 0
+    
+    @staticmethod
+    def unm_08_101(payload):
+        """Convert byte to 0 to 255 per UNM-08-101"""
+        return (payload[0]) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_102(payload):
+        """Convert byte to temperature in Celsius (-40 to 215°C) per UNM-08-102"""
+        return payload[0] - 40 if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_125(payload):
+        """Convert byte to 0 to 637 per UNM-08-125"""
+        return (payload[0] * 5) / 2  if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_131(payload):
+        """Convert byte to 0 to 765 per UNM-08-131"""
+        return (payload[0] * 3) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_141(payload):
+        """Convert byte to 0 to 1048 per UNM-08-141"""
+        return (payload[0] * 4) if len(payload) > 0 else 0
+    
+    @staticmethod
+    def unm_08_151(payload):
+        """Convert byte to 0 to 2048 per UNM-08-151"""
+        return (payload[0] * 8) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_155(payload):
+        """Convert byte to 0 to 2550 g per UNM-08-155"""
+        return (payload[0] * 10) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_159(payload):
+        """Convert byte to 0 to 3570 per UNM-08-159"""
+        return (payload[0] * 14) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_161(payload):
+        """Convert byte to 0 to 4096 per UNM-08-161"""
+        return (payload[0] * 16) if len(payload) > 0 else 0
+
+    @staticmethod
+    def unm_08_171(payload):
+        """Convert byte to 0 to 8160 per UNM-08-171"""
+        return (payload[0] * 32) if len(payload) > 0 else 0
+
+    # SED (State Encoded Data) 8-bit methods
+    @staticmethod
+    def sed_08_7(payload):
+        """Convert byte to state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 0):
+            return "Key Out"
+        elif (payload[0] == 1):
+            return "Key In Lock"
+        elif (payload[0] == 2):
+            return "Key In Unlock"
+        else:
+            return "Invalid"
+
+    @staticmethod
+    def sed_08_4(payload):
+        """Convert byte to Transmission state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 0):
+            return "Unknown"
+        elif (payload[0] == 1):
+            return "Reverse"
+        elif (payload[0] == 2):
+            return "Forward 1"
+        elif (payload[0] == 4):
+            return "Forward 2"
+        elif (payload[0] == 8):
+            return "Forward 3"
+        elif (payload[0] == 16):
+            return "Forward 4"
+        elif (payload[0] == 32):
+            return "Forward 5"
+        elif (payload[0] == 64):
+            return "Forward 6/Park"
+        elif (payload[0] == 128):
+            return "Neutral"
+        else:
+            return "Invalid"
+
+    @staticmethod
+    def sed_08_5(payload):
+        """Convert byte to Ignition Switch Position state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 1):
+            return "Accessory"
+        elif (payload[0] == 2):
+            return "Off / Lock"
+        elif (payload[0] == 4):
+            return "Off / Unlock"
+        elif (payload[0] == 8):
+            return "Run"
+        elif (payload[0] == 16):
+            return "Start"
+        else:
+            return "Invalid"
+
+    @staticmethod
+    def sed_08_6(payload):
+        """Convert byte to Transfer Case state string"""
+        if len(payload) == 0:
+            return None
+        if (payload[0] == 1):
+            return "Neutral"
+        elif (payload[0] == 2):
+            return "2WD High"
+        elif (payload[0] == 3):
+            return "4WD Low"
+        elif (payload[0] == 4):
+            return "4WD High"
+        else:
+            return "Invalid"
+
+    # UNM (Unsigned Numeric) 16-bit methods
+
+    @staticmethod
+    def unm_16_5(payload):
+        """Convert byte to 0 to 512 per UNM-16-5"""
+        return (payload[0] << 8 | payload[1]) / 128 if len(payload) > 1 else None
+
+    @staticmethod
+    def unm_16_11(payload):
+        """Convert byte to 0 to 655.35 per UNM-16-11"""
+        return (payload[0] << 8 | payload[1]) / 100 if len(payload) > 1 else None
+
+    @staticmethod
+    def unm_16_31(payload):
+        """Convert byte to 0 to 61383 per UNM-16-31"""
+        return (payload[0] << 8 | payload[1]) / 4 if len(payload) > 1 else None
+
+    @staticmethod
+    def unm_24_11(payload):
+        """Convert byte to 0 to 1677721.6 per UNM-24-11"""
+        return ((payload[0] << 16 | payload[1] << 8 | payload[2]) / 10) if len(payload) > 2 else None
+
+    @staticmethod
+    def unm_24_41(payload):
+        """Convert byte to 0 to 262143.98 per UNM-24-41"""
+        return ((payload[0] << 16 | payload[1] << 8 | payload[2]) / 64) if len(payload) > 2 else None
+
+    @staticmethod
+    def unm_32_31(payload):
+        """Convert byte to 0 to 4194303.75 per UNM-32-31"""
+        return ((payload[0] << 24 | payload[1] << 16 | payload[2] << 8 | payload[3]) / 64) if len(payload) > 3 else None
+
+    # ASC (ASCII) methods
+    @staticmethod
+    def asc_32_1(payload):
+        """Convert bytes to ASCII string per ASC-32-1"""
+        return "".join(chr(b) for b in payload[0:4]) if len(payload) > 3 else None   
+
+    # PKT (Packet) methods
+    @staticmethod
+    def pkt_32_2(payload):
+        """Convert bytes to ASCII string per PKT-32-2"""
+        return chr(payload[3]) if len(payload) > 3 else None
+    
+    @staticmethod
+    def dsp_c5_messages(payload):
+        """Convert bytes to ASCII string per DSP-C5-Messages"""
+        if (len(payload) < 1):
+            return None
+        if (payload[0] == 0x08) or (payload[0] == 0x01):
+            return "(Blinking)"
+        elif (payload[0] == 0x20) or (payload[0] == 0x40):
+            return "(Solid)"
+        return None
+
 
 '''
 OBD class is used to communicate
@@ -39,48 +417,205 @@ class OBD():
         self.dev_dxi_string = None
         self.dev_type = None
         self.dev_string = None
+        self.dvi_mode = False
+        self._dvi_rx_buffer = bytearray()
+        self._dvi_pending_lines = []
+        self._sp_lock = threading.RLock()
         
-        # Probably a better way to determine if something is a serial device or not.
-        if ("/dev" in filename or "COM" in filename or "com" in filename):
+        # There is probably a better way to determine if something is a serial device or not.
+        if filename.lower().startswith("com") or filename.startswith("/dev"):
             self.serial = True
         
+
     def __del__ (self):
         self.close()
+
+    def _vpw_bytes_to_hex_line(self, body):
+        return " ".join(f"{b:02X}" for b in body)
+
+    def _dvi_try_pop_frame(self):
+        """If a complete valid DVI frame is at the front of the buffer, consume and return (cmd, payload)."""
+        buf = self._dvi_rx_buffer
+        if len(buf) < 3:
+            return None
+        cmd = buf[0]
+        if cmd == 0x7F:
+            dlen = buf[1]
+            tot = 2 + dlen + 1
+            if len(buf) < tot:
+                return None
+            frame = bytes(buf[:tot])
+            del buf[:tot]
+            if frame[-1] != _dvi_checksum(frame[:-1]):
+                return None
+            return (0x7F, frame[2:-1])
+        if cmd == 0x09:
+            if len(buf) < 5:
+                return None
+            dlen = (buf[1] << 8) | buf[2]
+            tot = 1 + 2 + dlen + 1
+            if len(buf) < tot:
+                return None
+            frame = bytes(buf[:tot])
+            del buf[:tot]
+            if frame[-1] != _dvi_checksum(frame[:-1]):
+                return None
+            return (0x09, frame[3:-1])
+        if cmd == 0x08:
+            dlen = buf[1]
+            tot = 2 + dlen + 1
+            if len(buf) < tot:
+                return None
+            frame = bytes(buf[:tot])
+            del buf[:tot]
+            if frame[-1] != _dvi_checksum(frame[:-1]):
+                return None
+            return (0x08, frame[2:-1])
+        dlen = buf[1]
+        tot = 2 + dlen + 1
+        if len(buf) < tot:
+            return None
+        frame = bytes(buf[:tot])
+        del buf[:tot]
+        if frame[-1] != _dvi_checksum(frame[:-1]):
+            return None
+        return (cmd, frame[2:-1])
+
+    def _dvi_feed(self):
+        """Non-blocking read of any waiting serial bytes into the DVI buffer."""
+        n = self.sp.in_waiting
+        if n:
+            self._dvi_rx_buffer.extend(self.sp.read(n))
+
+    def _dvi_transact(self, cmd, data, timeout=3.0):
+        """Send one DVI command and wait for response cmd+0x10 (or raise on 7F / timeout)."""
+        pkt = _dvi_pack(cmd, data)
+        self.sp.write(pkt)
+        end = time.perf_counter() + timeout
+        while time.perf_counter() < end:
+            self._dvi_feed()
+            while True:
+                popped = self._dvi_try_pop_frame()
+                if popped is None:
+                    break
+                rcmd, payload = popped
+                if rcmd == 0x7F:
+                    raise Exception(f"OBDX DVI fault: {payload.hex()}")
+                if rcmd in (0x08, 0x09):
+                    self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(payload))
+                    continue
+                if rcmd == cmd + 0x10:
+                    return payload
+            time.sleep(0.002)
+        raise Exception("OBDX DVI command timeout")
+
+    def _open_obdx_dvi_vp_monitor(self):
+        """Switch to DVI and enable VPW passive monitoring (OBDX Pro reference manual §3)."""
+        self.sp.write(b"DX DP 1\r\n")
+        rsp = self.sp.read_until(b">")
+        if len(rsp) == 0 or b"OK" not in rsp:
+            raise Exception("OBDX did not accept DX DP 1 (switch to DVI)")
+        self.dvi_mode = True
+        self._dvi_rx_buffer.clear()
+        self._dvi_pending_lines.clear()
+        self.sp.reset_input_buffer()
+        # Timestamp off (default off; explicit), VPW protocol, network on — order per manual
+        # §3.9.3: 24 02 03 NN — NN=00 timestamp off (explicit; default is off)
+        self._dvi_transact(0x24, [0x03, 0x00])
+        # §3.11: "31 02 01 XX" = len 0x02, payload 0x01 (sub) + XX (VPW = 0x01)
+        self._dvi_transact(0x31, [0x01, 0x01])
+        # "31 02 02 XX" = len 0x02, payload 0x02 (sub) + XX (network on = 0x01)
+        self._dvi_transact(0x31, [0x02, 0x01])
+
+    def _recover_from_obdx_dvi_mode(self):
+        """
+        Prior exit in DVI leaves the tool speaking binary; ATZ is then parsed as garbage (7F...).
+        Try DVI 'change API to ELM' (manual §3.11.3), then software reboot if needed.
+        """
+        self.sp.reset_input_buffer()
+        self.sp.write(_dvi_pack(0x31, [0x06, 0x00]))
+        time.sleep(0.35)
+        self.sp.reset_input_buffer()
+        self.sp.write(b"\r")
+        r = self.sp.read_until(b">")
+        if b">" in r:
+            return
+        print("OBDX: ELM API switch not detected; sending DVI software reboot (0x25)...")
+        self.sp.reset_input_buffer()
+        self.sp.write(_dvi_reboot_to_boot_frame())
+        time.sleep(2.2)
+        self.sp.reset_input_buffer()
+        self.sp.write(b"\r")
+        self.sp.read_until(b">")
+
+    def _open_elm_vp_monitor(self):
+        self.sp.write(b'atsp2\r\n')
+        if (len(self.sp.read_until(b'>')) == 0):
+            raise Exception("Device did not accept configuration")
+        self.sp.write(b'ath1\r\n')
+        if (len(self.sp.read_until(b'>')) == 0):
+            raise Exception("Device did not accept configuration")
+        self.sp.write(b'atma\r\n')
+        if (len(self.sp.read_until(b'\r\n')) == 0):
+            raise Exception("Device did not enter atma mode")
         
     def open(self):
     
         if (self.serial):
-            print ("Opening serial port:",self.filename)
+            print ("Opening serial port:", self.filename)
         else:
             print ("Opening file:", self.filename)
+
 
         if (self.serial):
             if self.sp:
                 self.sp.close()
 
-            self.sp = serial.Serial(timeout=3)
+            self.sp = serial.Serial(timeout=OBD_SERIAL_PROBE_TIMEOUT)
             self.sp.port = self.filename
             self.sp.open()
             
-            if (self.sp.is_open == False):
+            if (not self.sp.is_open):
                 raise Exception("Unable to open serial port")
                 
             
-            # Configure the modem
-            self.sp.write(b'\r')        # Wake the part
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
-            self.sp.write(b'atz\r\n')   # Reset the device
-            reset_response = self.sp.read_until(b'>')
-            if (len(reset_response) == 0): raise Exception("Did not receieve any data from device. Wrong serial port?")
-            if (b'OK' not in reset_response):
-                # Seems we interrupted a command, let's try again
-                self.sp.write(b'atz\r\n')   # Reset the device
-                reset_response = self.sp.read_until(b'>')
-                if (len(reset_response) == 0): raise Exception("Did not receieve any data from device. Wrong serial port?")
-                if (b'OK' not in reset_response and reset_response[-1] != b'>'): raise Exception("Device did not acknowledge reset request")
+            # Configure the modem (must be ELM text mode; if last session used DVI, recover first)
+            self.sp.reset_input_buffer()
+            self.sp.write(b'\r')
+            wake = self.sp.read_until(b'>')
+            if len(wake) == 0:
+                self._recover_from_obdx_dvi_mode()
+                self.sp.write(b'\r')
+                wake = self.sp.read_until(b'>')
+            if len(wake) == 0:
+                raise Exception("No data received. Not connected/wrong serial port?")
 
-            self.sp.write(b'atz\r\n')   # Reset the device
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not respond to reset")
+            reset_ok = False
+            for attempt in range(3):
+                self.sp.write(b'atz\r\n')
+                reset_response = self.sp.read_until(b'>')
+                if len(reset_response) == 0:
+                    if attempt < 2:
+                        self._recover_from_obdx_dvi_mode()
+                        continue
+                    raise Exception("No data received after ATZ. Wrong serial port?")
+                if b'OK' in reset_response and reset_response.rstrip().endswith(b'>'):
+                    reset_ok = True
+                    break
+                if attempt < 2:
+                    print("Unexpected ATZ response (adapter may be stuck in DVI); recovering...")
+                    self._recover_from_obdx_dvi_mode()
+                    continue
+                raise Exception(
+                    "Unexpected reset response after ATZ (expected OK and '>'). Raw: %r"
+                    % (reset_response,)
+                )
+            if not reset_ok:
+                raise Exception("Device did not accept ATZ reset")
+
+            self.sp.write(b'atz\r\n')
+            if len(self.sp.read_until(b'>')) == 0:
+                raise Exception("Device did not respond to final reset")
             self.sp.write(b'atl1\r\n')  # Enable new line characters between commands/messages
             if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
             
@@ -97,25 +632,24 @@ class OBD():
             self.dev_dxi_string = self.sp.read_until(b'>').decode("utf-8")
             self.dev_dxi_string = re.search('\n(.*?)( SN.*)?\r',self.dev_dxi_string).group(1)
 
-            if ("?" not in self.dev_sti_string):
-                self.dev_type = "STN"
-                self.dev_string = self.dev_sti_string
-            elif ("?" not in self.dev_dxi_string):
+            # Prefer OBDX when DX I responds — STN may also answer STI without '?'
+            if ("?" not in self.dev_dxi_string):
                 self.dev_type = "OBDX"
                 self.dev_string = self.dev_dxi_string
+            elif ("?" not in self.dev_sti_string):
+                self.dev_type = "STN"
+                self.dev_string = self.dev_sti_string
             else:
                 self.dev_type = "ELM"
                 self.dev_string = self.dev_ati_string
 
             print("Detected device was a",self.dev_type,"with a version string of:",self.dev_string)
-            
 
-            self.sp.write(b'atsp2\r\n') # Set protocol to VPW J1850
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
-            self.sp.write(b'ath1\r\n')  # Enable headers
-            if (len(self.sp.read_until(b'>')) == 0): raise Exception("Device did not accept configuration")
-            self.sp.write(b'atma\r\n')  # Begin monitoring bus traffic
-            if (len(self.sp.read_until(b'\r\n')) == 0): raise Exception("Device did not enter atma mode")
+            if self.dev_type == "OBDX":
+                self._open_obdx_dvi_vp_monitor()
+            else:
+                self._open_elm_vp_monitor()
+            self.sp.timeout = OBD_SERIAL_RUNTIME_TIMEOUT
             print("Connected")
         else:
             self.fd = open(self.filename, 'r')
@@ -123,17 +657,128 @@ class OBD():
     def close(self):
         if self.serial:
             if self.sp.is_open:
-                self.sp.write(b'a\r\n')
-                time.sleep(1)
-                self.sp.close()
+                with self._sp_lock:
+                    if self.dvi_mode:
+                        try:
+                            self.sp.reset_input_buffer()
+                            # §3.11.3 — return to ELM so the next open() can use ATZ / DX DP 1
+                            self.sp.write(_dvi_pack(0x31, [0x06, 0x00]))
+                            time.sleep(0.2)
+                        except Exception:
+                            pass
+                        self.dvi_mode = False
+                    else:
+                        self.sp.write(b'a\r\n')
+                        time.sleep(1)
+                    self.sp.close()
         else:
             self.fd.close()
-        
+
     def read(self):
         if self.serial:
-            return self.sp.readline().decode("utf-8") 
+            with self._sp_lock:
+                if self.dvi_mode:
+                    if self._dvi_pending_lines:
+                        return self._dvi_pending_lines.pop(0) + "\n"
+                    end = time.perf_counter() + (self.sp.timeout or 3.0)
+                    while time.perf_counter() < end:
+                        self._dvi_feed()
+                        while True:
+                            popped = self._dvi_try_pop_frame()
+                            if popped is None:
+                                break
+                            rcmd, payload = popped
+                            if rcmd == 0x7F:
+                                print("OBDX DVI bus fault:", payload.hex())
+                                continue
+                            if rcmd in (0x08, 0x09):
+                                return self._vpw_bytes_to_hex_line(payload) + "\n"
+                            if rcmd in (0x20, 0x21):
+                                continue
+                            print("OBDX DVI unsolicited frame cmd=%02X: %s" % (rcmd, payload.hex()))
+                        time.sleep(0.002)
+                    return ""
+                return self.sp.readline().decode("utf-8")
         else:
             return self.fd.readline()
+
+    def send_message(self, header, payload):
+        """Send a VPW frame. OBDX DVI: 0x10/0x11 while monitoring. ELM/STN: exit ATMA, AT SH, send, AT MA."""
+        if not self.serial or not self.sp.is_open:
+            return False
+        with self._sp_lock:
+            try:
+                hdr = bytes.fromhex(header.replace(" ", ""))
+                pl = bytes.fromhex(payload.replace(" ", ""))
+                full = hdr + pl
+            except ValueError:
+                return False
+            if self.dvi_mode:
+                return self._dvi_send_message(full)
+            return self._elm_send_message(header, payload)
+
+    def _elm_send_message(self, header, payload):
+        """ELM327-style: break ATMA, set header, send hex payload, resume monitor."""
+        try:
+            h = "".join(header.split())
+            if len(h) % 2 != 0 or not h:
+                return False
+            spaced = " ".join(h[i : i + 2].upper() for i in range(0, len(h), 2))
+            pls = "".join(payload.split())
+            if len(pls) % 2 != 0:
+                return False
+            self.sp.write(b"\r")
+            time.sleep(0.08)
+            n = self.sp.in_waiting
+            if n:
+                self.sp.read(n)
+            self.sp.write(f"at sh {spaced}\r\n".encode())
+            if len(self.sp.read_until(b">")) == 0:
+                return False
+            self.sp.write(f"{pls}\r\n".encode())
+            if len(self.sp.read_until(b">")) == 0:
+                return False
+            self.sp.write(b"atma\r\n")
+            if len(self.sp.read_until(b"\r\n")) == 0:
+                if len(self.sp.read_until(b">")) == 0:
+                    return False
+            return True
+        except Exception as e:
+            print(f"ELM send_message: {e}")
+            return False
+
+    def _dvi_send_message(self, full_frame):
+        """Send-to-network (manual §3.6/3.7). Caller must hold self._sp_lock."""
+        try:
+            if len(full_frame) > 255:
+                body = bytes([0x11]) + len(full_frame).to_bytes(2, "big") + full_frame
+                pkt = body + bytes([_dvi_checksum(body)])
+            else:
+                pkt = _dvi_pack(0x10, full_frame)
+            self.sp.write(pkt)
+            end = time.perf_counter() + 3.0
+            while time.perf_counter() < end:
+                self._dvi_feed()
+                while True:
+                    popped = self._dvi_try_pop_frame()
+                    if popped is None:
+                        break
+                    rcmd, body = popped
+                    if rcmd in (0x08, 0x09):
+                        self._dvi_pending_lines.append(self._vpw_bytes_to_hex_line(body))
+                        continue
+                    if rcmd == 0x7F:
+                        print("OBDX DVI send fault:", body.hex())
+                        return False
+                    if rcmd in (0x20, 0x21):
+                        return True
+                    # Other DVI responses (e.g. config ack) — ignore while waiting for 20/21
+                    continue
+                time.sleep(0.002)
+            return False
+        except Exception as e:
+            print(f"DVI send_message: {e}")
+            return False
         
     def is_open(self):
         if self.serial:
@@ -145,63 +790,482 @@ class OBD():
 class VPW_frame:
     ''' 
     Functional Addresses commonly used on GM J1850 VPW Vehicles
-    C is for command (request)
-    S is for status (response)
+    C is for command (request) - Bit 0 = 0
+    S is for status (response) - Bit 0 = 1
 
     These are defined as well in SAE J2178-4
+
+    A status is always a read
+    A command is either a load or modify
     '''
     func_addresses = {
-        0x0B:"(C) Eng Air Intake",      0x0B:"(S) Eng Air Intake",
-        0x12:"(C) Fuel",                0x13:"(S) Fuel",
-        0x14:"(C) AC Clutch",           0x15:"(S) AC Clutch",
-        0x1A:"(C) Engine RPM",          0x1B:"(S) Engine RPM",
-        0x24:"(C) Wheels",              0x25:"(S) Wheels",
-        0x28:"(C) Vehicle Speed",       0x29:"(S) Vehicle Speed",
-        0x2A:"(C) Traction Control",    0x2B:"(S) Traction Control",
-        0x32:"(C) Brakes",              0x33:"(S) Brakes",
-        0x34:"(C) Steering",            0x35:"(S) Steering",
-        0x3A:"(C) Trans",               0x3B:"(S) Trans",
-        0x48:"(C) Eng Coolant",         0x49:"(S) Eng Coolant",
-        0x4A:"(C) Eng Oil",             0x4B:"(S) Eng Oil",
-        0x52:"(C) Engine Sys",          0x53:"(S) Engine Sys",
-        0x58:"(C) Suspension",          0x59:"(S) Suspension",
-        0x62:"(C) Cruise Control",      0x63:"(S) Cruise Control",
-        0x72:"(C) Charging System",     0x73:"(S) Charging System",
-        0x7A:"(C) Odometer",            0x7B:"(S) Odometer",
-        0x82:"(C) Fuel System",         0x83:"(S) Fuel System",
-        0x84:"(C) Vehicle Motion",      0x85:"(S) Vehicle Motion",
-        0x86:"(C) Ign Switch",          0x87:"(S) Ign Switch",
-        0x92:"(C) Veh Security",        0x93:"(S) Veh Security",
-        0x96:"(C) Chimes",              0x97:"(S) Chimes",
-        0xC6:"(C) Extern Access",       0xC7:"(S) Extern Access",
-        0xCE:"(C) MFG Specific",        0xCF:"(S) MFG Specific",
-        0xD2:"(C) Restraints",          0xD3:"(S) Restraints",
-        0xDA:"(C) Exterior Lamps",      0xDB:"(S) Exterior Lamps",
-        0xDE:"(C) Interior Lamps",      0xDF:"(S) Interior Lamps",
-        0xE4:"(C) Tires",               0xE5:"(S) Tires",
-        0xE6:"(C) Defrost",             0xE7:"(S) Defrost",
-        0xEA:"(C) MFG Specific",        0xEB:"(S) MFG Specific",
-        0xF2:"(C) Ext Environment",     0xF3:"(S) Ext Environment",
-        0xFA:"(C) VIN",                 0xFB:"(S) VIN",
-        0xFE:"(C) Network Control",     0xFF:"(S) Network Control"
+        0x0B:"Eng Air Intake",
+        0x12:"Throttle",
+        0x14:"AC Clutch",
+        0x1A:"Engine RPM",
+        0x24:"Wheels",
+        0x28:"Vehicle Speed",
+        0x2A:"Traction Control",
+        0x32:"Brakes",
+        0x34:"Steering",
+        0x3A:"Trans",
+        0x48:"Eng Coolant",
+        0x4A:"Eng Oil",
+        0x52:"Engine Sys",
+        0x58:"Suspension",
+        0x62:"Cruise Control",
+        0x72:"Charging System",
+        0x7A:"Odometer",
+        0x82:"Fuel System",
+        0x84:"Vehicle Motion",
+        0x86:"Ign Switch",
+        0x88:"Tell Tales (Warnings)",
+        0x92:"Veh Security",
+        0x96:"Chimes",
+        0xB2:"HVAC",
+        0xC4:"Door Locks",
+        0xC6:"Extern Access",
+        0xCE:"MFG Specific",
+        0xD2:"Restraints",
+        0xDA:"Exterior Lamps",
+        0xDE:"Interior Lamps",
+        0xE4:"Tires",
+        0xE6:"Defrost",
+        0xEA:"Display Commands",
+        0xF2:"Ext Environment",
+        0xFA:"VIN",
+        0xFE:"Network Control",
     }
+
+
     
     '''
     Physical Module Addresses Used in GM VPW-based Vehicles.
     These came from C5 vehicles, but should be consistent across similar 1997-2004 era GM vehicles
+    A lot of data is missing when looking at vehicle logs
+
+    Secondary IDs are used to identify the type of data being sent for functional addresses.
+    Secondary ID is bits 5-0 of the first data byte.
+    Q-bit is bit 7 of the first data byte.
+    C-bit is bit 6 of the first data byte.
+
+    Field for secondary IDs [Name, Q-bit = 0, Q-bit = 1, Ext Addr, PRN]
+    Q bit is a single bit used to signal a binary state (i.e. On/Off)
+    Ext Addr is the second data byte used to identify the physical location of the device
+    PRN is the PRN of the message, which tells us how to do the math to get the actual value.
+
+    # Custom functions can still be defined inline if needed
+    # PRN can have inline definitions with a lambda function ["unit", lambda payload: custom_calculation(payload)],
+    # example: ["unit", lambda payload: (payload[0] * 1) / 2 if len(payload) > 0 else 0],
     '''
+    secondary_ids = {
+        0x12: {  # Throttle
+            0x01: ["Sensor 1 Position", "", "", "", ["%", PRD.unm_08_61]],
+            0x02: ["Sensor 2 Position", "", "", "", ["%", PRD.unm_08_61]],
+            0x03: ["Sensor 3 Position", "", "", "", ["%", PRD.unm_08_61]],
+            0x10: ["Throttle Kicker", "E", "D", "", None],
+            0x11: ["Throttle Position", "", "", "", ["%", PRD.unm_08_61]],
+        },
+        0x1A: {  # Engine RPM
+            0x01: ["Low Res RPM", "", "", "", ["rpm", PRD.unm_08_71]],
+            0x02: ["High Res RPM", "", "", "", ["rpm", PRD.unm_16_31]],
+            0x10: ["High Res RPM", "", "", "", ["rpm", PRD.unm_16_31]], # Found on 2001 C5 Z06
+            0x20: ["Idle Speed", "Enabled", "Disabled", "", ["rpm", PRD.unm_08_161]],
+        },
+        0x28: { # Vehicle Speed
+            0x01: ["Vehicle Speed", "", "", "", ["km/h", PRD.unm_08_101]],
+            0x02: ["Vehicle Speed", "", "", "", ["km/h", PRD.unm_16_5]],
+        },
+        0x32: { # Brakes
+            0x03: ["ABS Active", "Y", "N", "", None],
+            0x04: ["ABS System On / Off", "On", "Off", "", None],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x0A: ["System Faulted", "Y", "N", "", None],
+            0x10: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x11: ["Supply Pump Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_171]],
+            0x12: ["Fluid Level - Percent", "", "", "", ["%", PRD.unm_08_71]],
+            0x13: ["Fluid Level - Volume", "", "", "", ["L", PRD.unm_08_15]],
+            0x14: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x16: ["Fluid Capacity", "", "", "", ["L", PRD.unm_08_15]],
+            0x20: ["Parking Brake Sw. Active", "Y", "N", "", None],
+            0x21: ["Torque Convertor Clutch - Brake Sw. Active", "Y", "N", "", None],
+            0x22: ["Brake Lamp - Brake Sw. Active", "Y", "N", "", None],
+            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+        },
+        0x3A: { # Transmission
+            0x01: ["Torque Convertor Lock(ed)", "Y", "N", "", None],
+            0x02: ["Clutch Enable", "E", "D", "", None],
+            0x03: ["Actual Gear Position w/ Shift in Progress", "Y", "N", "", ["", PRD.sed_08_4]],
+            0x04: ["Range Selected (PRNDL position)", "", "", "", ["", PRD.sed_08_4]],
+            0x05: ["Transfer Case (4WD)", "", "", "", ["", PRD.sed_08_6]],
+            0x06: ["Commanded Gear", "", "", "", ["", PRD.sed_08_4]],
+            0x07: ["Range Actual (PRNDL sense at transmission)", "", "", "", ["", PRD.sed_08_4]],
+            0x08: ["Transmission Kickdown", "Y", "N", "", None],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x0A: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x0B: ["Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_151]],
+            0x0C: ["Fluid Level - Percent", "", "", "", ["%", PRD.unm_08_71]],
+            0x0D: ["Fluid Level - Volume", "", "", "", ["L", PRD.unm_08_41]],
+            0x0E: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x10: ["Fluid Capacity", "", "", "", ["L", PRD.unm_08_41]],
+            0x14: ["Park/Neutral Sw. Active", "Y", "N", "", None],
+            0x1D: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+        },
+        0x48: { # Engine Coolant
+            0x10: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x32: ["Low Coolant Level", "Y", "N", "", None],
+        },
+        0x4A: { # Engine Oil
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x10: ["Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x11: ["Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_141]],
+            0x12: ["Fluid Level - Percent", "", "", "", ["%", PRD.unm_08_71]],
+            0x13: ["Fluid Level - Volume", "", "", "", ["L", PRD.unm_08_41]],
+            0x14: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x15: ["Oil Viscosity", "", "", "", ["cSt.", PRD.unm_08_41]],
+            0x16: ["Fluid Capacity", "", "", "", ["L", PRD.unm_08_41]],
+            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+            0x30: ["Fluid Temperature High", "Y", "N", "", None],
+            0x32: ["Low Oil Level", "Y", "N", "", None],
+        },
+        0x52: { # Engine Systems - Other
+            0x04: ["Engine Running", "Y", "N", "", ""],
+        },
+        0x72: {  # Charging System (Command ID)
+            0x01: ["Charging Voltage", "", "", "", ["V", PRD.unm_08_32]],
+            0x02: ["Battery Voltage", "", "", "", ["V", PRD.unm_08_32]],
+            0x0A: ["Battery Current", "", "", "", ["A", PRD.unm_08_21]],
+            0x08: ["Cluster Voltage", "", "", "", ["V", PRD.unm_16_11]], # Found on 2001 C5 Z06
+            0x21: ["Charging System Faulted", "Y", "N", "", None],
+        },
+        0x7A: { # Odometer
+            0x01: ["Odometer", "", "", "", ["km", PRD.unm_32_31]],
+            0x02: ["Odometer", "", "", "", ["mi", PRD.unm_24_11]], # Found on 2001 C5 Z06
+            0x03: ["Trip Reset", "R", "~R", "", None],
+            0x04: ["Trip Odometer", "", "", "", ["km", PRD.unm_24_41]],
+            0x20: ["Trip Reset Sw. Active", "Y", "N", "", None],
+        },
+        0x82: {  # Fuel System
+            0x0A: ["Unknown Value", "", "", "", None], # Found on 2001 C5 Z06
+            0x11: ["Fuel Pressure", "", "", "", ["kPa", PRD.unm_08_131]],
+            0x13: ["Fuel Level - Volume", "", "", "", ["L", PRD.unm_16_11]],
+            0x16: ["Fuel Capacity", "", "", "", ["L", PRD.unm_16_11]],
+            0x32: ["Low Fuel Level", "Y", "N", "", None],
+        },
+        0x86: { # Ignition
+            0x04: ["Ignition Switch Position", "", "", "", ["", PRD.sed_08_5]],
+            0x05: ["Key-In-Ignition", "Y", "N", "", None],
+        },
+        0x88: {  # Tell Tales (Warnings)
+            0x01: ["Seatbelt", "On", "Off", "", None],
+            0x02: ["Service Engine Soon", "On", "Off", "", None],
+            0x03: ["Check Engine (MIL)", "On", "Off", "", None],
+            0x04: ["High Beam Indicator", "On", "Off", "", None],
+            0x05: ["Left Turn Indicator", "On", "Off", "", None],
+            0x06: ["Right Turn Indicator", "On", "Off", "", None],
+            0x07: ["Airbag", "On", "Off", "", None],
+            0x08: ["Anti-Lock Brake System Failed", "On", "Off", "0", None],
+            0x09: ["Traction Control System Failed", "On", "Off", "0", None],
+            0x0A: ["Security", "On", "Off", "0", None],
+            0x0B: ["Low Fuel", "On", "Off", "0", None],
+            0x0C: ["Low Coolant", "On", "Off", "0", None],
+            0x0D: ["Low Oil", "On", "Off", "0", None],
+            0x0E: ["Low Voltage", "On", "Off", "0", None],
+            0x0F: ["Upshift", "On", "Off", "0", None],
+            0x10: ["Low Washer Fluid", "On", "Off", "0", None],
+            0x11: ["Traction Control Active", "On", "Off", "0", None],
+            0x12: ["Alternator Failure", "On", "Off", "0", None],
+            0x13: ["Low Brake Fluid", "On", "Off", "0", None],
+            0x14: ["Overdrive", "On", "Off", "0", None],
+            0x15: ["Traction Control Disabled", "On", "Off", "0", None],
+            0x21: ["Convertible Latch Warning", "On", "Off", "0", None],
+            0x22: ["Super Lock System Warning", "On", "Off", "0", None],
+            0x23: ["Catalyst Over Temperature", "On", "Off", "0", None],
+            0x24: ["Vehicle Speed Control", "On", "Off", "0", None]
+        },
+        0xB2: {  # HVAC (Climate Control)
+            0x02: ["Blower Fan Speed", "", "", "", None],
+            0x06: ["Multi-Zone Mode", "E", "D", "", None],
+            0x07: ["Low Refrigerant", "Y", "N", "", None],
+            0x09: ["Fluid Life Reset", "R", "~R", "", None],
+            0x0A: ["HVAC Set Temperature", "", "", "8.2", ["°C", PRD.unm_08_73]],
+            0x10: ["High Side Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x11: ["High Side Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_159]],
+            0x12: ["Fluid Charge - Percent", "", "", "", ["%", PRD.unm_08_61]],
+            0x13: ["Fluid Charge - Weight", "", "", "", ["g", PRD.unm_08_155]],
+            0x14: ["Fluid Remaining Life", "", "", "", ["%", PRD.unm_08_61]],
+            0x16: ["Fluid Capacity - Weight", "", "", "", ["g", PRD.unm_08_155]],
+            0x20: ["Low Side Fluid Temperature", "", "", "", ["°C", PRD.unm_08_102]],
+            0x21: ["Low Side Fluid Pressure", "", "", "", ["kPa", PRD.unm_08_125]],
+            0x22: ["Fan Increment Speed Sw. Active", "Y", "N", "", None],
+            0x23: ["Fan Decrement Speed Sw. Active", "Y", "N", "", None],
+            0x26: ["Multi-Zone Mode Sw. Active", "Y", "N", "", None],
+            0x29: ["Fluid Life Reset Sw. Active", "Y", "N", "", None],
+            0x2A: ["Increment Temp Sw. Active", "Y", "N", "", None],
+            0x2B: ["Decrement Temp Sw. Active", "Y", "N", "", None],
+        },
+        0xC4: {  # Door Locks
+            0x01: ["Lock", "L", "U", "8.5", None],
+            0x02: ["Unlock Enable", "E", "D", "8.5", None],
+            0x03: ["Lock Cylinder Secure", "Y", "N", "8.5", None],
+            0x04: ["Key-in-Lock Cylinder", "Y", "N", "8.5", None],
+            0x05: ["Master Controller Lock", "L", "N", "8.5", None],
+            0x06: ["Lock Cylinder State", "L", "U", "8.5", ["", PRD.sed_08_7]],
+            0x07: ["Super/Double Lock", "L", "U", "8.5", None],
+            0x08: ["Remote Lock w/ Transmitter ID", "L", "U", "8.5", ["", PRD.unm_08_101]],
+            0x09: ["Remote Lock", "L", "U", "8.5", None],
+            0x10: ["Remote Lock Request", "L", "U", "8.5", None], # Found on 2001 C5 Z06
+            0x20: ["Lock Sw Active", "Y", "N", "8.5", None],
+            0x21: ["Unlock Sw Active", "Y", "N", "8.5", None],
+            0x22: ["Unlock Enable Sw Active", "Y", "N", "8.5", None],
+            0x25: ["Master Lock Sw Active", "Y", "N", "8.5", None],
+            0x26: ["Master Unlock Sw Active", "Y", "N", "8.5", None],
+        },
+        0xC6: {  # External Access
+            0x01: ["Open", "Y", "N", "8.5", None],
+            0x02: ["Close", "Y", "N", "8.5", None],
+            0x11: ["Remote Open/Close w/ Transmitter ID", "Open", "Close", "8.5", ["", PRD.unm_08_101]],
+            0x12: ["Remote Open/Close", "Open", "Close", "8.5", None],
+            0x21: ["Ajar Sw. Active", "Y", "N", "8.5", None],
+            0x22: ["Door Handle Sw. Active", "Y", "N", "8.5", None],
+            0x23: ["Door Jamb Sw. Active", "Y", "N", "8.5", None],
+        },
+        0xD2: { # Restraints
+            0x01: ["Passive Restraint Enagaged", "Y", "N", "8.6", None],
+            0x02: ["Passive Restraint Retracted", "Y", "N", "8.6", None],
+            0x03: ["Passive Restraint Attached", "Y", "N", "8.6", None],
+            0x04: ["Seatbelt Attached", "Y", "N", "8.6", None],
+            0x05: ["Shoulder Adjustment Up Motion", "En", "Dis", "8.6", None],
+            0x06: ["Shoulder Adjustment Down Motion", "En", "Dis", "8.6", None],
+            0x07: ["Air Bag Deployed", "Y", "N", "8.6", None],
+        },
+        0xDA: {  # Exterior Lamps
+            0x01: ["Headlamp", "On", "Off", "8.8", None],
+            0x02: ["Tail Lamp", "On", "Off", "8.8", None],
+            0x03: ["Brake Lamp", "On", "Off", "8.8", None],
+            0x04: ["Park Lamp", "On", "Off", "8.8", None],
+            0x05: ["Turn Lamp", "On", "Off", "8.8", None],
+            0x06: ["High Beam Lamp", "On", "Off", "8.8", None],
+            0x07: ["Hazard Lamp", "On", "Off", "8.8", None],
+            0x08: ["Reverse Lamp", "On", "Off", "8.8", None],
+            0x09: ["Fog Lamp", "On", "Off", "8.8", None],
+            0x0A: ["Daytime Running Lamp", "On", "Off", "8.8", None],
+            0x0B: ["Spot Lamp", "On", "Off", "8.8", None],
+            0x0C: ["Cargo Lamp", "On", "Off", "8.8", None],
+            0x0D: ["Cornering Lamp", "On", "Off", "8.8", None],
+            0x0E: ["Driving Lamp", "On", "Off", "8.8", None],
+            0x0F: ["Coach Lamp", "On", "Off", "8.8", None],
+            0x10: ["Autolamp Delay", "E", "D", "8.8", ["s", PRD.unm_08_101]],
+            0x11: ["Flash-to-Pass", "E", "D", "8.8", None],
+            0x12: ["Remote Headlamp On/Off w/Transmitter ID", "On", "Off", "8.8", ["", PRD.unm_08_101]],
+            0x13: ["Remote Headlamp", "On", "Off", "8.8", None],
+            0x21: ["Headlamp Sw. Active", "Y", "N", "8.8", None],
+            0x22: ["Right Turn Sw. Active", "Y", "N", "8.8", None],
+            0x24: ["Park Lamp Sw. Active", "Y", "N", "8.8", None],
+            0x25: ["Left Turn Sw. Active", "Y", "N", "8.8", None],
+            0x26: ["High Beam Sw. Active", "Y", "N", "8.8", None],
+            0x27: ["Hazard Sw. Active", "Y", "N", "8.8", None],
+            0x28: ["Fog Lamp Sw. Active", "Y", "N", "8.8", None],
+            0x29: ["Driving Lamp Sw. Active", "Y", "N", "8.8", None]
+        },
+        0xDE: {  # Interior Lamps
+            0x01: ["Courtesy Lamp", "On", "Off", "8.9", None],
+            0x02: ["Dome Lamp", "On", "Off", "8.9", None], 
+            0x03: ["Puddle Lamp", "On", "Off", "8.9", None],
+            0x04: ["Vanity Mirror Lamp", "On", "Off", "8.9", None],
+            0x05: ["Opera Lamp", "On", "Off", "8.9", None],
+            0x06: ["Reading Lamp", "On", "Off", "8.9", None],
+            0x07: ["Hood Lamp", "On", "Off", "8.9", None],
+            0x08: ["Trunk Lamp", "On", "Off", "8.9", None],
+            0x09: ["Glove Box Lamp", "On", "Off", "8.9", None],
+            0x10: ["Illuminated Entry", "E", "D", "0", None],
+            0x11: ["Display Brightness & External Lamps", "On", "Off", "0", ["%", PRD.unm_08_61]],
+            0x21: ["Courtesy Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x22: ["Dome Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x23: ["Puddle Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x24: ["Vanity Mirror Sw. Active", "Y", "N", "8.9", None],
+            0x25: ["Opera Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x26: ["Reading Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x27: ["Hood Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x28: ["Trunk Lamp Sw. Active", "Y", "N", "8.9", None],
+            0x29: ["Glove Box Lamp Sw. Active", "Y", "N", "8.9", None],
+        },
+        0xEA: { # Display Commands
+            0x20: ["Display", "Activate", "Deactivate", "DISP.C5", ["", PRD.dsp_c5_messages]], # Found on 2001 C5 Z06
+        },
+        0xF2: { # External Environment
+            0x10: ["Outside Temperature", "", "", "", ["°C", PRD.unm_08_73]],
+            0x11: ["Barometric Pressure", "", "", "", ["kPa", PRD.unm_08_101]],
+            0x13: ["Sun Load", "", "", "8.3", ["mW/CM^2", PRD.unm_08_71]],
+            0x15: ["Photo Cell Dark", "Yes", "No", "8.3", None]
+        },
+        0xFA: {  # VIN
+            0x01: ["VIN Dig 1", "", "", "", ["", PRD.pkt_32_2]],
+            0x02: ["VIN Digit 2-5", "", "", "", ["", PRD.asc_32_1]],
+            0x03: ["VIN Digit 6-9", "", "", "", ["", PRD.asc_32_1]],
+            0x04: ["VIN Digit 10-13", "", "", "", ["", PRD.asc_32_1]],
+            0x05: ["VIN Digit 14-17", "", "", "", ["", PRD.asc_32_1]],
+            0x06: ["VIN RSVD", "", "", "", None],
+            0x07: ["VIN RSVD", "", "", "", None],
+        },
+        0xFE: {  # Network Control
+            0x02: ["Bus Wake-Up", "Y", "N", "", None],
+            0x03: ["Node Alive", "", "", "", None],
+            0x04: ["Node Sleep", "Y", "N", "", None],
+        }
+    }
+    
+    ext_addresses = {
+        "8.1": {  # Tires
+            0x00: "ALL",
+            0x10: "All Front",
+            0x11: "Left Front",
+            0x17: "Right Front",
+            0x30: "All Rear",
+            0x31: "Left Rear",
+            0x37: "Right Rear",
+            0x3C: "Spare Tire",
+        },
+        "8.2": {  # HVAC Zones
+            0x00: "ALL",
+            0x20: "All Front",
+            0x22: "Driver Side Front",
+            0x26: "Passenger Side Front",
+            0x28: "All Rear",
+            0x2A: "Driver Side Rear",
+            0x2E: "Passenger Side Rear",
+        },
+        "8.3": {  # Window Wiper/Washer, Defrost, and photocell
+            0x00: "ALL",
+            0x1C: "Front",
+            0x34: "Rear",
+        },
+        "8.4": {  # Mirrors
+            0x00: "ALL",
+            0x1A: "Driver Side",
+            0x1C: "Rear View",
+            0x1E: "Passenger Side",
+        },
+        "8.5": { # Doors and Door Locks
+            0x00: "All Doors",
+            0x14: "Hood",
+            0x1E: "Pass Glove Box",
+            0x20: "All Front Doors",
+            0x22: "Driver Front Door",
+            0x24: "Convertible Top",
+            0x26: "Pass Front Door",
+            0x28: "All Rear Doors",
+            0x2A: "Rear Driver Door",
+            0x2E: "Passenger Side Rear Door",
+            0x31: "Left Side Fuel Door",
+            0x34: "Trunk",
+            0x37: "Right Side Fuel Door",
+            0x3C: "Only or Rear Fuel Door",
+        },
+        "8.6": { # Seats and Restraints
+            0x00: "ALL",
+            0x20: "All Front",
+            0x22: "Driver Side Front",
+            0x24: "Front Center",
+            0x26: "Passenger Side Front",
+            0x28: "All Rear",
+            0x2A: "Driver Side Rear",
+            0x2C: "Rear Center",
+            0x2E: "Passenger Side Rear",
+            0x30: "All Rear - Rear (Van)",
+            0x32: "Driver Side Rear - Rear (Van)",
+            0x36: "Passenger Side Rear - Rear (Van)",
+        },
+        "8.7": {  # Windows
+            0x00: "ALL",
+            0x20: "All Front",
+            0x22: "Driver Side Front",
+            0x24: "Front Sun Roof",
+            0x26: "Passenger Side Front",
+            0x28: "All Rear",
+            0x2A: "Driver Side Rear",
+            0x2C: "Rear Sun Roof",
+            0x2E: "Passenger Side Rear",
+            0x34: "Rear Windshield",
+        },
+        "8.8": {  # External Lamps
+            0x00: "ALL",
+            0x01: "Left Side (Turn Signal)",
+            0x07: "Right Side (Turn Signal)",
+            0x08: "All Front",
+            0x09: "Left Front",
+            0x0F: "Right Front",
+            0x38: "All Rear",
+            0x39: "Left Rear",
+            0x3C: "CHMSL",
+            0x3F: "Right Rear",
+        },
+        "8.9": {  # Internal Lamps
+            0x00: "ALL",
+            0x20: "All Front",
+            0x22: "Driver Side Front",
+            0x26: "Passenger Side Front",
+            0x28: "All Rear",
+            0x2A: "Driver Side Rear",
+            0x2C: "Dome Lamp",
+            0x2E: "Passenger Side Rear",
+        },
+        "DISP.C5": { # Display commands found on 2001 C5 Z06
+            0x81: "Change Oil Soon",
+            0x82: "Change Oil Now",
+            0x84: "Oil Level Low",
+            0x89: "Upshift Now",
+            0x8E: "Check Gauges",
+            0x8F: "Service Vehicle Soon (Ding)",
+            0x95: "Service ABS",
+            0x96: "ABS Active",
+            0x99: "Service Traction System",
+            0x9A: "Traction System Active",
+            0x9B: "(EBCM: Normal Mode On/Off)",
+            0x9E: "(Security Light Solid)",
+            0xA5: "Door Ajar",
+            0xA6: "Trunk Ajar",
+            0xAC: "Service TPMS",
+            0xAD: "Service Ride Control",
+            0xAE: "Service Vehicle Soon (No Ding)",
+            0xB7: "Reduced Engine Power",
+            0xB8: "Service Active Handling",
+            0xC2: "Active Handling Active",
+            0xCB: "High Trans Temp",
+            0xD0: "Hatch Ajar",
+            0xD3: "Active Handling Warming Up",
+            0xD4: "Warm Up Complete",
+            0xD5: "Max speed 159 mph",
+            0xDE: "Tonnaeu Ajar",
+            0xE8: "(EBCM: Comp Mode)",
+            0xE9: "Engine Protection, Reduce RPM",
+            0xEF: "(Brake Light Icon)",
+        }
+    }
+
+    
+
+
+
     phys_addresses = {
         0x10:"ECU",
+        0x11:"ECM (CAN)", #C6 through BCM from CAN
+        0x18:"TCM (CAN)", #C6 through BCM from CAN
         0x28:"ABS",
         0x40:"BCM",
         0x58:"SRS",
         0x60:"Cluster",
+        0x62:"HUD", # C6
         0x80:"Radio",
+        0x89:"Dig Radio Receiver", # C6
+        0x97:"Onstar", # C6
         0x99:"HVAC",
         0xA0:"LDCM",
         0xA1:"RDCM",
+        0xA4:"L Door Sw", #C6
         0xA6:"SCM",
         0xB0:"Remotes",
+        0xC1:"RCDLR", #C6
         0xF1:"Ext Tool"
     }
 
@@ -212,49 +1276,222 @@ class VPW_frame:
     
     @staticmethod
     def process(byteString):
-        if (VPW_frame.is_valid(byteString) == False):
+        if (not VPW_frame.is_valid(byteString)):
             return None
         
         try:
             byteArray = bytearray.fromhex(byteString)
-        except:
+        except ValueError:
             print ("Issue processing: ", byteString)
             return None
             
-        if len(byteArray) < 5:
+        # OBDX DVI (and similar) often omits the trailing VPW CRC on passive RX, so frames
+        # are 4 bytes (Hdr, TA, SA, one data) instead of 5 with CRC — especially heartbeats.
+        if len(byteArray) < 4:
             return None
 
-        priority = byteArray[0] >> 5
         mode = 'F'
         modeType = "?"
-        if byteArray[0] & 0x04:
+        priority = byteArray[0] >> 5
+        wBit = byteArray[1] & 0x01
+        cBit = (byteArray[3] & 0x40) >> 6
+        ifrBit = (byteArray[0] & 0x08) >> 3
+        addrMode = (byteArray[0] & 0x04) >> 2
+        modeOp = "Load"
+
+        if addrMode == 1: # Physical Address
             mode = 'P'
             modeType = (byteArray[0] & 0x0F) 
             if (modeType) == 0x0C:
                 modeType = "N-N"
-        
-        if (byteArray[0] & 0x0F) == 0x08:
-            modeType = "Func"
-        elif (byteArray[0] & 0x0F) == 0x09:
-            modeType = "Broadcast"
-        elif (byteArray[0] & 0x0F) == 0x0A:
-            modeType = "Query"
-        elif (byteArray[0] & 0x0F) == 0x0B:
-            modeType = "Read"
+        else: # Functional Address
+            mode = 'F'
+            modeType = (byteArray[0] & 0x03)
+
+            # ZZWC is ZZ of modeType, W of wBit, C of cBit
+            zzwc = (modeType << 2) | (wBit << 1) | cBit
+
+            if (zzwc == 0b0000):
+                modeType = "F Comm/Status"
+                modeOp = "Load"
+            elif (zzwc == 0b0001):
+                modeType = "F Comm/Status"
+                modeOp = "Modify"
+            elif (zzwc == 0b0010):
+                modeType = "F Comm/Status"
+                modeOp = "Report Status"
+            elif (zzwc == 0b0011):
+                modeType = "F Comm/Status"
+                modeOp = "MFG Spec"
+            elif (zzwc == 0b0100):
+                modeType = "F Req/Query"
+                modeOp = "Status Req"
+            elif (zzwc == 0b0101):
+                modeType = "F Req/Query"
+                modeOp = "Report Ack"
+            elif (zzwc == 0b0110):
+                modeType = "F Req/Query"
+                modeOp = "Command Req"
+            elif (zzwc == 0b0111):
+                modeType = "F Req/Query"
+                modeOp = "Func Query"
+            elif (zzwc == 0b1000):
+                modeType = "F Ext Comm/Status"
+                modeOp = "Load"
+            elif (zzwc == 0b1001):
+                modeType = "F Ext Comm/Status"
+                modeOp = "Modify"
+            elif (zzwc == 0b1010):
+                modeType = "F Ext Comm/Status"
+                modeOp = "Report Status"
+            elif (zzwc == 0b1011):
+                modeType = "F Ext Comm/Status"
+                modeOp = "MFG Spec"
+            elif (zzwc == 0b1100):
+                modeType = "F Ext Req/Query"
+                modeOp = "Status Req"
+            elif (zzwc == 0b1101):
+                modeType = "F Ext Req/Query"
+                modeOp = "Report Ack"
+            elif (zzwc == 0b1110):
+                modeType = "F Ext Req/Query"
+                modeOp = "Command Req"
+            elif (zzwc == 0b1111):
+                modeType = "F Ext Req/Query"
+                modeOp = "Func Query"
             
         if (byteArray[0] & 0x10) == 0x10:
             mode = "?H"
-        if (byteArray[0] & 0x08) == 0x00:
+        if (not ifrBit):
             mode = "?IFR"
             
-        # Check if is a heart beat
+            # Check for heart beat
         isHeartBeat = False
         if (byteArray[1] == 0xFF or byteArray[1] == 0xFE):
-            if (len(byteArray) == 5):
-                if (byteArray[3] == 0x03):
-                    isHeartBeat = True
+            if byteArray[3] == 0x03 and len(byteArray) in (4, 5):
+                isHeartBeat = True
 
-        return {'priority': priority, 'mode': mode, 'mode type': modeType, 'message': byteArray, 'heartbeat': isHeartBeat}
+        return {'priority': priority, 'mode': mode, 'mode type': modeType, 'mode operation': modeOp, 'message': byteArray, 'heartbeat': isHeartBeat}
+        
+
+    @staticmethod
+    def get_description(func_address, msg):
+        """Get description for functional messages based on secondary ID
+        Returns tuple: (data_value, full_description)
+        """
+        if (len(msg) == 0):
+            return ("", "No Message")
+        
+        payload = msg["message"][3:]
+        if len(payload) == 0:
+            return ("", "No Payload")
+        
+        # Extract secondary ID from lower 6 bits of first payload byte
+        secondary_id = payload[0] & 0x3F
+        
+        # Extract Q-bit (bit 7) from first payload byte
+        q_bit = (payload[0] & 0x80) >> 7
+        
+        # Convert Status ID (odd) to Command ID (even) for lookup
+        # Status IDs are always odd, Command IDs are always even
+        if func_address & 0x01:  # If odd (Status ID)
+            command_address = func_address - 1  # Convert to Command ID
+        else:
+            command_address = func_address  # Already Command ID
+        
+        # Look up in secondary_ids dictionary using the Command ID
+        if command_address in VPW_frame.secondary_ids:
+            if secondary_id in VPW_frame.secondary_ids[command_address]:
+                secondary_info = VPW_frame.secondary_ids[command_address][secondary_id]
+                if isinstance(secondary_info, str):
+                    return ("", f"{secondary_info} ({msg['mode operation']})")
+                elif isinstance(secondary_info, (list, set, tuple)) and len(secondary_info) > 0:
+                    # Convert to list and get the first element (Name)
+                    info_list = list(secondary_info)
+                    base_description = info_list[0]  # Return the Name (first element)
+                    
+                    # Add Q-bit text if available (but not for Status Req or Report Ack messages)
+                    q_text = ""
+                    if len(info_list) >= 3 and msg.get('mode operation') not in ['Status Req', 'Report Ack']:  # Make sure we have at least 3 fields and not Status Req/Report Ack
+                        if q_bit == 1 and len(info_list) > 1:
+                            # Q-bit is 1, use 2nd field (index 1)
+                            q_text = info_list[1]
+                        elif q_bit == 0 and len(info_list) > 2:
+                            # Q-bit is 0, use 3rd field (index 2)
+                            q_text = info_list[2]
+                    
+                    # Check message type to determine processing logic
+                    message_type = msg.get('mode type', '')
+                    is_extended = 'F Ext' in message_type
+                    
+                    # Check for external address lookup (4th field) - only for F Ext messages
+                    ext_address_text = ""
+                    if is_extended and len(info_list) >= 4 and len(payload) > 1:  # Only for F Ext messages
+                        ext_addr_key = info_list[3]  # 4th field (index 3)
+                        if ext_addr_key and ext_addr_key != "0" and ext_addr_key in VPW_frame.ext_addresses:
+                            # Look up the second data byte in the ext_addresses
+                            second_byte = payload[1]
+                            if second_byte in VPW_frame.ext_addresses[ext_addr_key]:
+                                ext_address_text = f" - {VPW_frame.ext_addresses[ext_addr_key][second_byte]}"
+                    
+                    # Process PRD if available (5th field) - for both F and F Ext messages
+                    data_value = ""
+                    if len(info_list) >= 5 and info_list[4] is not None:  # Check if PRD data exists
+                        prd_data = info_list[4]  # 5th field (index 4) - PRD data [unit, function]
+                        if isinstance(prd_data, list) and len(prd_data) == 2:
+                            unit = prd_data[0]
+                            math_function = prd_data[1]
+                            
+                            if is_extended:
+                                # For F Ext messages, PRD data starts at 3rd byte (skip secondary ID and ext address)
+                                data_payload = payload[2:] if len(payload) > 2 else []
+                            else:
+                                # For regular F messages, PRD data starts at 2nd byte (skip secondary ID)
+                                data_payload = payload[1:] if len(payload) > 1 else []
+                            
+                            # Check if we have enough data bytes for the calculation
+                            if len(data_payload) > 1:  # Most PRD functions need at least 2 bytes
+                                try:
+                                    # Handle string references to static methods
+                                    if isinstance(math_function, str):
+                                        if hasattr(PRD, math_function):
+                                            math_function = getattr(PRD, math_function)
+                                        else:
+                                            print(f"Error: PRD function {math_function} not found")
+                                            result = base_description
+                                            return (data_value, result)
+                                    
+                                    if callable(math_function):
+                                        calculated_value = math_function(data_payload)
+                                        if calculated_value is not None:
+                                            if isinstance(calculated_value, (int, float)):
+                                                data_value = f"{calculated_value:.2f} {unit}"
+                                            else:
+                                                data_value = f"{calculated_value} {unit}"
+                                except (IndexError, ValueError, ZeroDivisionError) as e:
+                                    print(f"Error processing PRD: {e}")
+                    
+                    # If no PRD data and message type is 'Report Status' or 'Load', show Q-bit value in Data column
+                    if not data_value and (msg.get('mode operation') in ['Report Status', 'Load']) and len(info_list) >= 3:
+                        if q_bit == 1 and len(info_list) > 1:
+                            data_value = info_list[1]  # Q-bit is 1, use 2nd field
+                        elif q_bit == 0 and len(info_list) > 2:
+                            data_value = info_list[2]  # Q-bit is 0, use 3rd field
+                    
+                    # Combine all parts (excluding PRD data since it's now in Data column)
+                    result = base_description
+                    if q_text:
+                        result += f": {q_text}"
+                    if ext_address_text:
+                        result += ext_address_text
+                    
+                    # Add operation type at the end
+                    result += f" ({msg['mode operation']})"
+                    
+                    return (data_value, result)
+    
+        #return f"Unknown SecID: {secondary_id:02X}"
+        return ("", f"({msg['mode operation']})")
         
     
         
@@ -272,7 +1509,7 @@ class MessageManager():
         self.filter_compare_bytes = 2
         self.hide_heartbeat = False
         
-    def new_message(self, input_string):
+    def new_message(self, input_string, skip_summary=False, transmit_echo=False):
         # Send string off to get parsed
         inString = input_string.rstrip()
         newMsg = VPW_frame.process(inString)
@@ -281,44 +1518,72 @@ class MessageManager():
         if not (newMsg):
             print ("Invalid message recieved in new_message: ", input_string)
             return
+
+        if newMsg["heartbeat"] and self.UIHook.hideHeartbeatsEverywhere.get() and not transmit_echo:
+            return
         
         #Decode address
         taModule = "NA"
         saModule = "NA"
+        description = "NA"
+        
         if (newMsg["mode"] == "F"):
-            if newMsg["message"][1] in VPW_frame.func_addresses:
-                taModule = str("${:02X}".format(newMsg["message"][1])+" "+VPW_frame.func_addresses[newMsg["message"][1]])
+            # For functional messages, always try to decode the TA
+            target_addr = newMsg["message"][1]
+            
+            # Convert Status ID (odd) to Command ID (even) for lookup
+            if target_addr & 0x01:  # If odd (Status ID)
+                command_addr = target_addr - 1  # Convert to Command ID
+                prefix = "(S) "
             else:
-                taModule = "${:02X}".format(newMsg["message"][1])
+                command_addr = target_addr  # Already Command ID
+                prefix = "(C) "
+            
+            # Look up the command address in func_addresses
+            if command_addr in VPW_frame.func_addresses:
+                taModule = f"${target_addr:02X} {prefix}{VPW_frame.func_addresses[command_addr]}"
+            else:
+                taModule = f"${target_addr:02X}"
+            
+            # Get description for ALL functional messages
+            data_value, description = VPW_frame.get_description(target_addr, newMsg)
         else:
             if newMsg["message"][1] in VPW_frame.phys_addresses:
                 taModule = str("${:02X}".format(newMsg["message"][1])+" "+VPW_frame.phys_addresses[newMsg["message"][1]])
             else:
                 taModule = "${:02X}".format(newMsg["message"][1])
+            data_value = ""  # No data value for physical messages
                 
         if newMsg["message"][2] in VPW_frame.phys_addresses:
             saModule = str("${:02X}".format(newMsg["message"][2])+" "+VPW_frame.phys_addresses[newMsg["message"][2]])
         else:
             saModule = "${:02X}".format(newMsg["message"][2])
-        #Physical address
-        # Append message to data frame
-        self.messageHistory.append([len(self.messageHistory), newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:],inString])
+
+        if transmit_echo:
+            if description and description != "NA":
+                description = "[TX] " + description
+            else:
+                description = "[TX] (transmitted)"
+        
+        # Append message to data frame (now includes data value and description)
+        self.messageHistory.append([len(self.messageHistory), newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], inString, data_value, description])
 
         tempMsg = self.messageHistory[-1]
+        tree_tags = ("tx_frame",) if transmit_echo else ()
+        self.UIHook.new_message(tempMsg, tags=tree_tags)
+        self.UIHook.update_status_bar(len(self.messageHistory))
         
-        # See if an existing message exists
+        if skip_summary:
+            return
+        
         summaryInd = self.find_existing_summary(tempMsg)
-        self.UIHook.new_message(tempMsg)
-        self.UIHook.update_status_bar( len(self.messageHistory))
-        
-        
         
         # If hide heart beat is enabled, we'll just skip adding it to the summary altogether
         if (newMsg["heartbeat"] and self.UIHook.hideHeartbeats.get()):
             return
         
         if (summaryInd == -1):
-            self.messageSummary.append([len(self.messageSummary), 0, tempMsg[0], newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:]])
+            self.messageSummary.append([len(self.messageSummary), 1, tempMsg[0], newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], data_value, description])
             
             self.UIHook.new_message_summary(self.messageSummary[-1])
         else:
@@ -326,6 +1591,8 @@ class MessageManager():
             self.messageSummary[summaryInd][1] += 1
             self.messageSummary[summaryInd][2] = tempMsg[0]
             self.messageSummary[summaryInd][9] = tempMsg[7]
+            self.messageSummary[summaryInd][10] = data_value  # Update data value
+            self.messageSummary[summaryInd][11] = description  # Update description too
             
             self.UIHook.update_message_summary(summaryInd, self.messageSummary[summaryInd])
         
@@ -356,19 +1623,26 @@ class MessageManager():
                 elif (byteCompare == 0):
                     for row in rows:    
                         return row[0]
-                elif (byteCompare == 1):
+                elif byteCompare == 1:
                     for row in rows:
-                        if (row[9][0] == msg[7][0]):
+                        rp, mp = row[9], msg[7]
+                        if len(rp) == 0 and len(mp) == 0:
                             return row[0]
-                elif (byteCompare == 2):
+                        if len(rp) >= 1 and len(mp) >= 1 and rp[0] == mp[0]:
+                            return row[0]
+                elif byteCompare == 2:
                     for row in rows:
-                        if (row[9][0] == msg[7][0]):
-                            if (len(row[9]) == 1):
-                                return row[0]
-                            else:
-                                if (row[9][1] == msg[7][1]):
-                                    return row[0]                        
-                        
+                        rp, mp = row[9], msg[7]
+                        if len(rp) == 0 and len(mp) == 0:
+                            return row[0]
+                        if len(rp) < 1 or len(mp) < 1:
+                            continue
+                        if rp[0] != mp[0]:
+                            continue
+                        if len(rp) == 1:
+                            return row[0]
+                        if len(mp) >= 2 and rp[1] == mp[1]:
+                            return row[0]
             
         return -1
     
@@ -377,27 +1651,166 @@ class MessageManager():
         
         
 '''
+Device mode enumeration for type-safe state management
+'''
+class DeviceMode(Enum):
+    DISCONNECTED = "DISCONNECTED"
+    MONITOR_MODE = "MONITOR_MODE"
+    COMMAND_MODE = "COMMAND_MODE"
+
+
+'''
+ToolManager class manages the OBD device connection state and coordinates
+between the device and UI threads. It handles connection/disconnection,
+tracks device mode (monitor vs command), and manages message sending.
+'''
+class ToolManager:
+    def __init__(self, message_queue, status_callback=None):
+        """
+        Initialize the ToolManager
+        Args:
+            message_queue: Queue object to send messages to UI thread
+            status_callback: Optional callback function(status_connected, device_string) for status updates
+        """
+        self.message_queue = message_queue
+        self.status_callback = status_callback
+        self.obd = None
+        self.reading_thread = None
+        self.device_mode = DeviceMode.DISCONNECTED
+        self.is_connected = False
+        self.device_string = None
+        
+    def connect(self, file_path):
+        """
+        Connect to OBD device or open file
+        Args:
+            file_path: Path to serial port or file
+        Returns:
+            True if successful, False otherwise
+        """
+        if self.is_connected:
+            self.disconnect()
+        
+        try:
+            self.reading_thread = ThreadedTask(self, self.message_queue, file_path)
+            self.reading_thread.start()
+            return True
+        except Exception as e:
+            print(f"Error connecting: {e}")
+            return False
+    
+    def disconnect(self):
+        """Disconnect from OBD device and stop reading thread"""
+        if self.reading_thread:
+            self.reading_thread.stop()
+            self.reading_thread.join(3)
+            if self.reading_thread.is_alive():
+                print("Warning: Reading thread did not stop cleanly")
+            self.reading_thread = None
+        
+        if self.obd:
+            self.obd.close()
+            self.obd = None
+        
+        self.is_connected = False
+        self.device_mode = DeviceMode.DISCONNECTED
+        self.device_string = None
+        if self.status_callback:
+            self.status_callback(False, "")
+    
+    def on_device_connected(self, obd_instance, device_string):
+        """Called by reading thread when device is connected"""
+        self.obd = obd_instance
+        self.is_connected = True
+        self.device_mode = DeviceMode.MONITOR_MODE  # Device starts in monitor mode
+        self.device_string = device_string
+        if self.status_callback:
+            self.status_callback(True, device_string)
+    
+    def on_device_disconnected(self):
+        """Called when device disconnects"""
+        self.is_connected = False
+        self.device_mode = DeviceMode.DISCONNECTED
+        self.device_string = None
+        if self.status_callback:
+            self.status_callback(False, "")
+    
+    def get_device_mode(self):
+        """Get current device mode"""
+        return self.device_mode
+    
+    def is_in_monitor_mode(self):
+        """Check if device is in monitor mode"""
+        return self.device_mode == DeviceMode.MONITOR_MODE
+    
+    def is_in_command_mode(self):
+        """Check if device is in command mode"""
+        return self.device_mode == DeviceMode.COMMAND_MODE
+    
+    def send_message(self, header, payload):
+        """
+        Send a VPW message via the serial port
+        Args:
+            header: Header bytes as space-separated hex string (e.g., "8C F1 10")
+            payload: Payload bytes as space-separated hex string (e.g., "24 00")
+        Returns:
+            True if successful, False otherwise
+        """
+        if not self.obd or not self.is_connected:
+            return False
+        
+        if not self.obd.serial:
+            return False  # Can't send to file
+        
+        # ELM/STN: ATMA must stop for AT commands, then resume. OBDX DVI: send uses 0x10 while RX continues.
+        use_elm_atma_cycle = not self.obd.dvi_mode
+        if use_elm_atma_cycle and self.device_mode == DeviceMode.MONITOR_MODE:
+            self.device_mode = DeviceMode.COMMAND_MODE
+
+        success = self.obd.send_message(header, payload)
+
+        if use_elm_atma_cycle:
+            self.device_mode = DeviceMode.MONITOR_MODE
+
+        return success
+    
+    def get_obd_instance(self):
+        """Get the OBD instance (for direct access if needed)"""
+        return self.obd
+
+
+'''
 This class is used to run the serial/OBD class in a separate thread
 '''
 class ThreadedTask(threading.Thread):
-    def __init__(self, gui, file_path):
+    def __init__(self, tool_manager, queue, file_path):
         threading.Thread.__init__(self)
-        self.gui = gui
+        self.tool_manager = tool_manager
         self.file_path = file_path
         self.stop_var = False
         self.obd = None
+        self.queue = queue
+        self.start_time = None
+        self.end_time = None
+        self.message_count = 0
         
     def run(self):
         if (self.obd):
             self.obd.close()
 
+        # Reset and start timing
+        self.reset_stats()
+        self.start_time = time.perf_counter()
+        print(f"Starting file processing: {self.file_path}")
+
         self.obd = OBD(self.file_path)
         self.obd.open()
-        self.gui.update_obd_status(True,self.obd.dev_string)
-        threadPointer = threading.current_thread()
+        # Notify tool manager that device is connected
+        if self.tool_manager:
+            self.tool_manager.on_device_connected(self.obd, self.obd.dev_string)
 
         
-        while (self.stop_var == False):
+        while (not self.stop_var):
             try:
                 #time.sleep(0.1)  # Simulate long running process
                 line = self.obd.read()
@@ -405,28 +1818,88 @@ class ThreadedTask(threading.Thread):
                     break
 
                 if not line:
-                    continue
-                #TODO: Probably should use a queue instead of calling another thread's function...
-                self.gui.mm.new_message(line)
-            except:
-                print ("Exception in file reading thread")
+                    # End of file reached
+                    self.end_time = time.perf_counter()
+                    self.print_performance_stats()
+                    break
+                    
+                # Count and queue the message
+                self.message_count += 1
+                self.queue.put(line)
+            except Exception as e:
+                print(f"Exception in file reading thread: {e}")
+                self.end_time = time.perf_counter()
+                self.print_performance_stats()
                 break
         
         self.obd.close()
 
     def stop(self):
         self.stop_var = True
+        # If we haven't set end_time yet, set it now for partial stats
+        if self.start_time and not self.end_time:
+            self.end_time = time.perf_counter()
+            print("File processing stopped by user")
+            self.print_performance_stats()
+    
+    def reset_stats(self):
+        """Reset performance statistics"""
+        self.start_time = None
+        self.end_time = None
+        self.message_count = 0
+    
+    def print_performance_stats(self):
+        """Print performance statistics for file processing"""
+        if self.start_time and self.end_time:
+            total_time = self.end_time - self.start_time
+            messages_per_second = self.message_count / total_time if total_time > 0 else 0
+            
+            print("=" * 70)
+            print("FILE PROCESSING PERFORMANCE STATISTICS")
+            print("=" * 70)
+            print(f"File: {self.file_path}")
+            print(f"Total messages processed: {self.message_count}")
+            print(f"Total processing time: {total_time:.6f} seconds")
+            print(f"Total processing time: {total_time * 1000:.3f} milliseconds")
+            print(f"Total processing time: {total_time * 1000000:.1f} microseconds")
+            print(f"Messages per second: {messages_per_second:.2f}")
+            if self.message_count > 0:
+                avg_time_seconds = total_time / self.message_count
+                avg_time_ms = avg_time_seconds * 1000
+                avg_time_us = avg_time_seconds * 1000000
+                print(f"Average time per message: {avg_time_seconds:.6f} seconds")
+                print(f"Average time per message: {avg_time_ms:.3f} milliseconds")
+                print(f"Average time per message: {avg_time_us:.1f} microseconds")
+            else:
+                print("Average time per message: N/A")
+            print("=" * 70)
+        else:
+            print("Performance stats not available - timing data incomplete")
     
 '''
 Main application class that handles the GUI
 '''
 class Application(tk.Frame):
-    def __init__(self, root):
+    def __init__(self, root, initial_open=None):
         self.root = root
-        self.thread_reading = None
+        self._initial_open = (initial_open or "").strip() or None
+        self.queue = queue.Queue()
+        # Create ToolManager to handle OBD device state
+        self.tool_manager = ToolManager(self.queue, status_callback=self.update_obd_status)
+        self._last_send_selection = None
         self.initialize_user_interface()
         self.update_status_bar(False)
         self.mm = MessageManager(self)
+        # Start the queue processing
+        self.update_ui()
+        if self._initial_open:
+            self.root.after_idle(self._apply_initial_open)
+
+    def _apply_initial_open(self):
+        """CLI: pre-fill OBD Device field and run Read (serial port or log file path)."""
+        self.serial_port_entry.delete(0, tk.END)
+        self.serial_port_entry.insert(0, self._initial_open)
+        self.read_file()
  
     def initialize_user_interface(self):
         # Configure the root object for the Application
@@ -446,7 +1919,9 @@ class Application(tk.Frame):
         self.statusBarString = tk.StringVar()
         self.statusBarOBDString = tk.StringVar()
         self.messageTreeLock = tk.BooleanVar()
-        self.hideHeartbeats = tk.BooleanVar()
+        self.hideHeartbeats = tk.BooleanVar(master=self.root, value=True)
+        self.hideHeartbeatsEverywhere = tk.BooleanVar(master=self.root, value=True)
+        self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=False)
         self.messageUniqueByte = tk.StringVar()
         self.messageUniqueByte.set("2")
         
@@ -457,7 +1932,7 @@ class Application(tk.Frame):
         ''' Summary Tree at the top '''
         self.summaryTreeLabel = tk.Label(self.root, text="Summary Messages")
         self.summaryTreeLabel.grid(row=0, column=0, sticky=tk.W)
-        self.summaryTree = ttk.Treeview(self.root, columns=( 'Last MID', '# Msgs', 'Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload'))
+        self.summaryTree = ttk.Treeview(self.root, columns=( 'Last MID', '# Msgs', 'Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload', 'Data', 'Description'))
         self.summaryTreeScroll = ttk.Scrollbar(self.root)
         self.summaryTreeScroll.configure(command=self.summaryTree.yview)
         self.summaryTree.configure(yscrollcommand=self.summaryTreeScroll.set)
@@ -474,6 +1949,8 @@ class Application(tk.Frame):
         self.summaryTree.heading('#7', text='TA')
         self.summaryTree.heading('#8', text='SA')
         self.summaryTree.heading('#9', text='Payload')
+        self.summaryTree.heading('#10', text='Data')
+        self.summaryTree.heading('#11', text='Description')
         
  
         # Specify attributes of the columns (We want to stretch it!)
@@ -487,9 +1964,14 @@ class Application(tk.Frame):
         self.summaryTree.column('#7', minwidth=30, width=200, stretch=tk.YES)
         self.summaryTree.column('#8', minwidth=30, width=80, stretch=tk.YES)
         self.summaryTree.column('#9', minwidth=50, width=200, stretch=tk.YES)
+        self.summaryTree.column('#10', minwidth=50, width=100, stretch=tk.YES)
+        self.summaryTree.column('#11', minwidth=50, width=300, stretch=tk.YES)
  
         self.summaryTree.grid(row=1, column=0, sticky='nsew')
         self.summaryTreeScroll.grid(row=1, column=1, sticky='nsw')
+        
+        # Bind double-click event to summary tree
+        self.summaryTree.bind('<Double-1>', self.on_summary_double_click)
         
         
         
@@ -502,7 +1984,7 @@ class Application(tk.Frame):
         self.messageTree_checkbox.grid(row=2,column=0, sticky=tk.E)
         
         # Set the treeview for the raw transaction table
-        self.messageTree = ttk.Treeview(self.root, columns=('Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload'))
+        self.messageTree = ttk.Treeview(self.root, columns=('Hdr', 'Prio', 'Mode', 'Type', 'TA', 'SA', 'Payload', 'Data', 'Description'))
         self.messageTreeScroll = ttk.Scrollbar(self.root)
         self.messageTreeScroll.configure(command=self.messageTree.yview)
         self.messageTree.configure(yscrollcommand=self.messageTreeScroll.set)
@@ -516,6 +1998,8 @@ class Application(tk.Frame):
         self.messageTree.heading('#5', text='TA')
         self.messageTree.heading('#6', text='SA')
         self.messageTree.heading('#7', text='Payload')
+        self.messageTree.heading('#8', text='Data')
+        self.messageTree.heading('#9', text='Description')
         
  
         # Specify attributes of the columns (We want to stretch it!)
@@ -527,9 +2011,23 @@ class Application(tk.Frame):
         self.messageTree.column('#5', minwidth=30, width=170, stretch=tk.YES)
         self.messageTree.column('#6', minwidth=30, width=80, stretch=tk.YES)
         self.messageTree.column('#7', minwidth=50, width=200, stretch=tk.YES)
+        self.messageTree.column('#8', minwidth=50, width=100, stretch=tk.YES)
+        self.messageTree.column('#9', minwidth=50, width=300, stretch=tk.YES)
  
         self.messageTree.grid(row=3, column=0, sticky='nsew')
         self.messageTreeScroll.grid(row=3, column=1, sticky='nsw')
+        
+        # Bind double-click event to message tree
+        self.messageTree.bind('<Double-1>', self.on_message_double_click)
+        # Last row chosen for "Send Selected Message" — highlight persists until another row is clicked
+        for tv in (self.summaryTree, self.messageTree):
+            # Strong warm highlight so the send-target row is obvious on grey / default tree rows
+            tv.tag_configure("last_send_row", background="#ffb020", foreground="#000000")
+        self.messageTree.tag_configure("tx_frame", background="#a5d6a7", foreground="#1b4332")
+        self.summaryTree.bind("<<TreeviewSelect>>", self._on_summary_or_message_tree_select)
+        self.messageTree.bind("<<TreeviewSelect>>", self._on_summary_or_message_tree_select)
+        self.summaryTree.bind("<space>", self._on_trees_space_send_selected)
+        self.messageTree.bind("<space>", self._on_trees_space_send_selected)
         
         ''' Configuration Frame '''
         self.config_frame = tk.Frame(self.root, borderwidth = 1)
@@ -538,47 +2036,57 @@ class Application(tk.Frame):
         
         # Define the different GUI widgets
         self.config_label = tk.Label(self.config_frame, text="OBD II Configuration")
-        self.config_label.grid(row=0, column=0, columnspan=2, sticky=tk.W)
+        self.config_label.grid(row=0, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
-        config_sep.grid(row=1, columnspan = 2, sticky='ew')
+        config_sep.grid(row=1, columnspan = 3, sticky='ew')
         self.serial_label = tk.Label(self.config_frame, text="OBD Device Serial Port")
         self.serial_port_entry = tk.Entry(self.config_frame)
+        self.serial_browse_button = tk.Button(self.config_frame, text="Browse", command=self.browse_file)
         self.serial_label.grid(row=2, column=0, sticky=tk.W)
-        self.serial_port_entry.grid(row=2, column=1)
+        self.serial_port_entry.grid(row=2, column=1, sticky='ew')
+        self.serial_browse_button.grid(row=2, column=2, padx=(5, 0))
+        
+        # Enable standard key bindings for text selection
+        self.serial_port_entry.bind('<Control-a>', self.select_all_text)
+        self.serial_port_entry.bind('<Control-A>', self.select_all_text)
  
         self.idnumber_label = tk.Label(self.config_frame, text="Raw Line")
         self.idnumber_entry = tk.Entry(self.config_frame)
         self.idnumber_label.grid(row=3, column=0, sticky=tk.W)
         self.idnumber_entry.grid(row=3, column=1)
+        
+        # Enable standard key bindings for text selection
+        self.idnumber_entry.bind('<Control-a>', self.select_all_text)
+        self.idnumber_entry.bind('<Control-A>', self.select_all_text)
  
  
         self.submit_button = tk.Button(self.config_frame, text="Parse", command=self.insert_data)
         self.submit_button.grid(row=4, column=1, sticky=tk.W)
         self.read_button = tk.Button(self.config_frame, text="Read", command=self.read_file)
-        self.read_button.grid(row=4, column=1, sticky='e')
+        self.read_button.grid(row=4, column=2, sticky=tk.W)
  
  
- 
- 
-        # View settings
-        self.config_label = tk.Label(self.config_frame, text="View Settings")
-        self.config_label.grid(row=4, column=0, columnspan=2, sticky=tk.W)
+        # View settings (own rows so they do not overlap Parse/Read)
+        self.view_settings_label = tk.Label(self.config_frame, text="View Settings")
+        self.view_settings_label.grid(row=5, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
-        config_sep.grid(row=5, columnspan = 2, sticky='ew')
+        config_sep.grid(row=6, columnspan=3, sticky='ew')
         
-        self.view_hideHeartbeats = tk.Checkbutton(self.config_frame, text="Hide Module Heartbeats", variable=self.hideHeartbeats, onvalue=True, offvalue=False)
-        self.view_hideHeartbeats.grid(row=6,column=0, sticky=tk.E)
+        self.view_hideHeartbeats = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from summary table", variable=self.hideHeartbeats, onvalue=True, offvalue=False)
+        self.view_hideHeartbeats.grid(row=7, column=0, columnspan=3, sticky=tk.W)
+        self.view_hideHeartbeatsEverywhere = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from everything", variable=self.hideHeartbeatsEverywhere, onvalue=True, offvalue=False)
+        self.view_hideHeartbeatsEverywhere.grid(row=8, column=0, columnspan=3, sticky=tk.W)
         
         self.view_uniqueByte_label = tk.Label(self.config_frame, text="Compare First # Bytes")
-        self.view_uniqueByte_label.grid(row=7,column=0)
+        self.view_uniqueByte_label.grid(row=9, column=0, sticky=tk.W)
         self.view_uniqueByte = tk.OptionMenu(self.config_frame, self.messageUniqueByte, "0", "1", "2", "All")
-        self.view_uniqueByte.grid(row=7,column=1, sticky=tk.W)
+        self.view_uniqueByte.grid(row=9, column=1, sticky=tk.W)
         
         self.delete_button = tk.Button(self.config_frame, text="Clear Message Logs", command=self.delete_data)
-        self.delete_button.grid(row=100, column=0)
+        self.delete_button.grid(row=100, column=0, sticky=tk.W)
         
         self.delete_button = tk.Button(self.config_frame, text="Export Logs", command=self.export_log)
-        self.delete_button.grid(row=100, column=1)
+        self.delete_button.grid(row=100, column=1, sticky=tk.W)
  
         
         
@@ -589,7 +2097,7 @@ class Application(tk.Frame):
         ''' Transmit Message Frame '''
         self.transmit_frame = tk.Frame(self.root, borderwidth = 1)
         self.transmit_frame.grid(row=3, column = 3, rowspan=1, sticky='nsew')
-        self.transmit_frame.grid_rowconfigure(5, minsize=10)
+        self.transmit_frame.grid_rowconfigure(8, minsize=10)
         self.transmit_frame.grid_rowconfigure(90, weight=1)
         
         self.config_label = tk.Label(self.transmit_frame, text="Transmit Frame")
@@ -604,24 +2112,39 @@ class Application(tk.Frame):
         self.header_entry = tk.Entry(self.transmit_frame)
         self.header_entry.grid(row=2, column=1)
         self.header_entry.insert(0, "8C F1 10")
+        # Enable standard key bindings for text selection
+        self.header_entry.bind('<Control-a>', self.select_all_text)
+        self.header_entry.bind('<Control-A>', self.select_all_text)
         
         self.payload_label = tk.Label(self.transmit_frame, text="Payload")
         self.payload_label.grid(row=3, column=0)
         self.payload_entry = tk.Entry(self.transmit_frame)
         self.payload_entry.grid(row=3, column=1)
         self.payload_entry.insert(0, "24 00")
+        # Enable standard key bindings for text selection
+        self.payload_entry.bind('<Control-a>', self.select_all_text)
+        self.payload_entry.bind('<Control-A>', self.select_all_text)
         
-        self.copy_button = tk.Button(self.transmit_frame, text="Copy from selected")
-        self.copy_button.grid(row=4, column=0, sticky='s')
+        self.view_show_transmitted = tk.Checkbutton(
+            self.transmit_frame,
+            text="Show transmitted frames in message history",
+            variable=self.showTransmittedFrames,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.view_show_transmitted.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 4))
         
-        self.send_button = tk.Button(self.transmit_frame, text="Send")
-        self.send_button.grid(row=4, column=1, sticky='s')
+        self.send_button = tk.Button(self.transmit_frame, text="Send", command=self.on_transmit_send)
+        self.send_button.grid(row=5, column=1, sticky='s')
         
         config_sep = ttk.Separator(self.transmit_frame, orient='horizontal')
-        config_sep.grid(row=5, columnspan = 2, sticky='ew')
+        config_sep.grid(row=6, columnspan=2, sticky='ew')
         
-        self.send_selected_button = tk.Button(self.transmit_frame, text="Send Selected Message")
-        self.send_selected_button.grid(row=6, column=0, sticky='s')
+        self.send_selected_button = tk.Button(self.transmit_frame, text="Send Selected Message", command=self.on_transmit_send_selected)
+        self.send_selected_button.grid(row=7, column=0, sticky='s')
+        
+        self.help_button = tk.Button(self.transmit_frame, text="Help", command=self.show_help)
+        self.help_button.grid(row=100, column=1, sticky='s')
         
         self.exit_button = tk.Button(self.transmit_frame, text="Exit Program", command=self.on_app_close)
         self.exit_button.grid(row=100, column=0, sticky='s')
@@ -657,22 +2180,68 @@ class Application(tk.Frame):
         else:
             self.statusBarOBDString.set(str("OBD: Disconnected"))
     
+    def browse_file(self):
+        """Open file dialog to select a VPW log file"""
+        file_path = filedialog.askopenfilename(
+            title="Select VPW Log File or Serial Port",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("Log files", "*.log"),
+                ("All files", "*.*")
+            ]
+        )
+        if file_path:
+            self.serial_port_entry.delete(0, tk.END)
+            self.serial_port_entry.insert(0, file_path)
+    
     def insert_data(self):
         rawString = self.idnumber_entry.get()
         self.mm.new_message(rawString)
         
     def export_log(self):
-        fexport = open("export.txt", "w")
-        for line in self.mm.messageHistory:
-            fexport.write(line[-1]+"\r\n")
-        fexport.close()
+        """Export logs to a user-selected file"""
+        file_path = filedialog.asksaveasfilename(
+            title="Export VPW Logs",
+            defaultextension=".txt",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("Log files", "*.log"),
+                ("All files", "*.*")
+            ],
+            initialfile="export.txt"
+        )
+        
+        if file_path:
+            try:
+                with open(file_path, "w") as fexport:
+                    for line in self.mm.messageHistory:
+                        fexport.write(line[8] + "\r\n")  # line[8] is the raw hex data stream (inString)
+                print(f"Logs exported successfully to: {file_path}")
+            except Exception as e:
+                print(f"Error exporting logs: {e}")
+                messagebox.showerror("Export Error", f"Failed to export logs:\n{e}")
         
 
-    def new_message(self, newMsg):        
+    def new_message(self, newMsg, tags=()):
         # Print the message to the message history tree
-        self.messageTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
-                             values=("{:02X}".format(newMsg[1]), newMsg[4], newMsg[5],
-                             newMsg[6], newMsg[2], newMsg[3], str(" ".join(["{:02X}".format(x) for x in newMsg[7][:-1]]))))
+        self.messageTree.insert(
+            "",
+            "end",
+            iid=newMsg[0],
+            text=str(newMsg[0]),
+            values=(
+                "{:02X}".format(newMsg[1]),
+                newMsg[4],
+                newMsg[5],
+                newMsg[6],
+                newMsg[2],
+                newMsg[3],
+                _vpw_payload_hex_for_display(newMsg[7]),
+                newMsg[9],
+                newMsg[10],
+            ),
+            tags=tags,
+        )
 
         # If the scroll lock is enabled, then scroll down
         if (self.messageTreeLock.get()):
@@ -685,18 +2254,16 @@ class Application(tk.Frame):
     def new_message_summary(self, newMsg):        
         # Print the message to the message history tree
         self.summaryTree.insert('', 'end', iid=newMsg[0], text=str(newMsg[0]),
-                             values=(newMsg[0], 0, "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
-                             newMsg[8], newMsg[4], newMsg[5], str(" ".join(["{:02X}".format(x) for x in newMsg[9][:-1]]))))
+                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7],
+                             newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
         #self.sid = self.sid + 1
         
         
     def update_message_summary(self, index, newMsg):
-        values = self.summaryTree.item(index)
-        #print ("Updating UI: ", values, "and", newMsg)
         try:
             self.summaryTree.item(index, text=str(index),
-                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], str(" ".join(["{:02X}".format(x) for x in newMsg[9][:-1]]))))
-        except:
+                             values=(newMsg[2], newMsg[1], "{:02X}".format(newMsg[3]), newMsg[6], newMsg[7], newMsg[8], newMsg[4], newMsg[5], _vpw_payload_hex_for_display(newMsg[9]), newMsg[10], newMsg[11]))
+        except ValueError:
             print ("Issue updating index, ", newMsg)
             for child in self.summaryTree.get_children():
                 print(self.summaryTree.item(child)["values"])
@@ -710,6 +2277,8 @@ class Application(tk.Frame):
             
         for i in self.messageTree.get_children():
             self.messageTree.delete(i)
+        
+        self._last_send_selection = None
             
         self.mm = MessageManager(self)
             
@@ -718,31 +2287,242 @@ class Application(tk.Frame):
         
     def read_file(self):
         file_path = self.serial_port_entry.get()
-        
-        if (self.thread_reading):
-            # A thread exists already. Must mean it's already open. We must close/destroy it
-            self.thread_reading.stop()
-            self.thread_reading.join(3)
-            if (self.thread_reading.is_alive()):
-                print("Error ending thread...")
+        # Use ToolManager to handle connection
+        self.tool_manager.connect(file_path)
 
-        self.thread_reading = ThreadedTask(self, file_path)
-        self.thread_reading.start()
+    def _clear_last_send_row_highlight(self):
+        if not self._last_send_selection:
+            return
+        tree, iid = self._last_send_selection
+        try:
+            tree.item(iid, tags=())
+        except tk.TclError:
+            pass
+        self._last_send_selection = None
+
+    def _set_last_send_row_highlight(self, tree, iid):
+        """One row across both trees keeps tag last_send_row until another row is chosen."""
+        if self._last_send_selection and self._last_send_selection[0] == tree and self._last_send_selection[1] == iid:
+            return
+        self._clear_last_send_row_highlight()
+        try:
+            tree.item(iid, tags=("last_send_row",))
+            self._last_send_selection = (tree, iid)
+        except tk.TclError:
+            self._last_send_selection = None
+
+    def _on_summary_or_message_tree_select(self, event):
+        w = event.widget
+        if w not in (self.summaryTree, self.messageTree):
+            return
+        sel = w.selection()
+        if not sel:
+            return
+        self._set_last_send_row_highlight(w, sel[0])
+
+    def _on_trees_space_send_selected(self, event):
+        if event.widget not in (self.summaryTree, self.messageTree):
+            return
+        self.on_transmit_send_selected()
+        return "break"
+
+    def _maybe_record_transmit_echo(self, hdr, pl):
+        if not self.showTransmittedFrames.get():
+            return
+        line = f"{hdr} {pl}".strip()
+        self.mm.new_message(line, skip_summary=True, transmit_echo=True)
+
+    def on_transmit_send(self):
+        """Send Header + Payload using DVI (OBDX) or ELM/STN path."""
+        if not self.tool_manager.is_connected:
+            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            return
+        if not self.tool_manager.obd or not self.tool_manager.obd.serial:
+            messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
+            return
+        hdr = self.header_entry.get().strip()
+        pl = self.payload_entry.get().strip()
+        if not hdr or not pl:
+            messagebox.showwarning("Transmit", "Enter both Header and Payload (hex bytes).")
+            return
+        ok = self.tool_manager.send_message(hdr, pl)
+        if ok:
+            self._maybe_record_transmit_echo(hdr, pl)
+            cur = self.statusBarOBDString.get()
+            if cur.startswith("OBD: Connected"):
+                base = cur.split(" — ")[0]
+                self.statusBarOBDString.set(base + " — Last transmit: OK")
+        else:
+            messagebox.showerror(
+                "Transmit failed",
+                "The adapter did not acknowledge the send. Check hex fields and connection.",
+            )
+
+    def on_transmit_send_selected(self):
+        """Send the last single-clicked row from Summary or Message history (see highlight)."""
+        if not self.tool_manager.is_connected:
+            messagebox.showwarning("Not connected", "Open a serial device with Read first.")
+            return
+        if not self.tool_manager.obd or not self.tool_manager.obd.serial:
+            messagebox.showinfo("Transmit", "Transmit is only available on a live serial connection, not from a log file.")
+            return
+        if not self._last_send_selection:
+            messagebox.showwarning(
+                "No row chosen",
+                "Click a row in Summary or Message history to choose what to send (it will highlight).",
+            )
+            return
+        tree, iid = self._last_send_selection
+        try:
+            vals = tree.item(iid, "values")
+        except tk.TclError:
+            self._last_send_selection = None
+            messagebox.showwarning("Send target", "That row no longer exists. Click another message.")
+            return
+        is_summary = tree is self.summaryTree
+        pair = self._header_payload_from_values(vals, is_summary)
+        if not pair:
+            messagebox.showerror("Send target", "Could not build a frame from the selected row.")
+            return
+        hdr, pl = pair
+        self.header_entry.delete(0, tk.END)
+        self.header_entry.insert(0, hdr)
+        self.payload_entry.delete(0, tk.END)
+        self.payload_entry.insert(0, pl)
+        ok = self.tool_manager.send_message(hdr, pl)
+        if ok:
+            self._maybe_record_transmit_echo(hdr, pl)
+            cur = self.statusBarOBDString.get()
+            if cur.startswith("OBD: Connected"):
+                base = cur.split(" — ")[0]
+                self.statusBarOBDString.set(base + " — Last transmit: OK")
+        else:
+            messagebox.showerror(
+                "Transmit failed",
+                "The adapter did not acknowledge the send. Check the highlighted row and connection.",
+            )
+
+    def update_ui(self):
+        # Process any messages in the queue
+        try:
+            while True:
+                line = self.queue.get_nowait()
+                self.mm.new_message(line)
+        except queue.Empty:
+            pass
+        
+        # Schedule the next update
+        self.root.after(100, self.update_ui)
+    
+    def select_all_text(self, event):
+        """Select all text in the widget that triggered the event"""
+        event.widget.select_range(0, tk.END)
+        return "break"  # Prevent default behavior
+    
+    def on_summary_double_click(self, event):
+        """Handle double-click on summary tree to populate transmit frame"""
+        item = self.summaryTree.selection()[0] if self.summaryTree.selection() else None
+        if item:
+            values = self.summaryTree.item(item, 'values')
+            self.populate_transmit_frame(values, is_summary=True)
+    
+    def on_message_double_click(self, event):
+        """Handle double-click on message tree to populate transmit frame"""
+        item = self.messageTree.selection()[0] if self.messageTree.selection() else None
+        if item:
+            values = self.messageTree.item(item, 'values')
+            self.populate_transmit_frame(values, is_summary=False)
+    
+    def _header_payload_from_values(self, values, is_summary):
+        """Build transmit header + payload hex strings from a tree row's column values."""
+        try:
+            if is_summary:
+                if len(values) < 10:
+                    return None
+                hdr, ta, sa, payload = values[2], values[6], values[7], values[8]
+            else:
+                if len(values) < 8:
+                    return None
+                hdr, ta, sa, payload = values[0], values[4], values[5], values[6]
+            ta_hex = self.extract_hex_from_column(ta)
+            sa_hex = self.extract_hex_from_column(sa)
+            if ta_hex and sa_hex:
+                header = f"{hdr} {ta_hex} {sa_hex}"
+            else:
+                header = str(hdr)
+            return (header.strip(), str(payload).strip())
+        except (IndexError, TypeError, ValueError):
+            return None
+
+    def populate_transmit_frame(self, values, is_summary=False):
+        """Populate transmit frame fields with data from selected row"""
+        try:
+            pair = self._header_payload_from_values(values, is_summary)
+            if not pair:
+                print("Error: Not enough columns or bad data in tree row")
+                return
+            header, payload = pair
+            self.header_entry.delete(0, tk.END)
+            self.payload_entry.delete(0, tk.END)
+            self.header_entry.insert(0, header)
+            self.payload_entry.insert(0, payload)
+        except Exception as e:
+            print(f"Error populating transmit frame: {e}")
+    
+    def extract_hex_from_column(self, column_value):
+        """Extract hex value from TA/SA column (e.g., '$83 (S) Fuel System' -> '83')"""
+        try:
+            if not column_value:
+                return None
+            
+            # Look for hex pattern like $83, 83, 0x83, etc.
+            hex_match = re.search(r'[\$]?([0-9A-Fa-f]{2})', column_value)
+            if hex_match:
+                return hex_match.group(1).upper()
+            else:
+                return None
+        except Exception as e:
+            print(f"Error extracting hex from '{column_value}': {e}")
+            return None
+
+    def show_help(self):
+        """Display help window with program usage instructions"""
+        help_window = tk.Toplevel(self.root)
+        help_window.title("VPW Analyzer Help")
+        help_window.geometry("800x600")
+        help_window.resizable(True, True)
+        
+        # Create scrollable text widget
+        frame = tk.Frame(help_window)
+        frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        
+        text_widget = tk.Text(frame, wrap=tk.WORD, font=("Arial", 10))
+        scrollbar = ttk.Scrollbar(frame, orient=tk.VERTICAL, command=text_widget.yview)
+        text_widget.configure(yscrollcommand=scrollbar.set)
+        
+        # Pack widgets
+        text_widget.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        
+        # Help content (defined at top of file)
+        text_widget.insert(tk.END, HELP_TEXT)
+        text_widget.config(state=tk.DISABLED)  # Make read-only
+        
+        # Add close button
+        close_button = tk.Button(help_window, text="Close", command=help_window.destroy)
+        close_button.pack(pady=10)
 
     def on_app_close(self):
         if messagebox.askokcancel("Quit", "Are you sure you want to quit?"):
-            if (self.thread_reading):
-                self.thread_reading.stop()
-                self.thread_reading.join(3)
-                if (self.thread_reading.is_alive()):
-                    print("Error ending thread for app exit...")
+            # Disconnect via ToolManager
+            self.tool_manager.disconnect()
             self.root.destroy()
 
 
 
 
-if __name__ == "__main__" :
-    app = Application(tk.Tk())
+if __name__ == "__main__":
+    initial = sys.argv[1] if len(sys.argv) > 1 else None
+    app = Application(tk.Tk(), initial_open=initial)
     app.root.wm_protocol("WM_DELETE_WINDOW", app.on_app_close)
     app.root.mainloop()
-

@@ -1,5 +1,5 @@
 # VPW Analyzer
-A visual J1850 VPW analyzer written in Python
+A visual J1850 VPW analyzer written in Python and specifically developed for GM's VPW used in 1997-2004 (Gen 3) vehicles
 
 Requires Tkinter, Pandas, serial, and Python3
 These can be installed with pip or a package manager.
