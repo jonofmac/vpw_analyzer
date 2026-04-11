@@ -106,6 +106,7 @@ class MessageQueueWindow:
         q_bar.pack(fill=tk.X)
         ttk.Button(q_bar, text="New queue", command=self._new_queue).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(q_bar, text="Rename", command=self._rename_queue).pack(side=tk.LEFT, padx=(0, 4))
+        ttk.Button(q_bar, text="Duplicate", command=self._duplicate_queue).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(q_bar, text="Delete queue", command=self._delete_queue).pack(side=tk.LEFT, padx=(0, 12))
         ttk.Button(q_bar, text="Export…", command=self._export_queues).pack(side=tk.LEFT, padx=(0, 4))
         ttk.Button(q_bar, text="Import…", command=self._import_queues).pack(side=tk.LEFT)
@@ -421,6 +422,40 @@ class MessageQueueWindow:
         self.queue_tree.focus(last)
         self._refresh_messages()
 
+    def _duplicate_queue(self):
+        qi = self._selected_queue_index()
+        if qi is None:
+            messagebox.showinfo("Duplicate", "Select a queue first.", parent=self.win)
+            return
+        src = self.store.groups[qi]
+        suggested = f"{src['name']} copy"
+        name = simpledialog.askstring(
+            "Duplicate queue",
+            "Name for the new queue:",
+            parent=self.win,
+            initialvalue=suggested,
+        )
+        if not name:
+            return
+        name = name.strip()
+        if not name:
+            return
+        new_msgs = [
+            {
+                "header": m["header"],
+                "payload": m["payload"],
+                "description": m.get("description", ""),
+            }
+            for m in src["messages"]
+        ]
+        self.store.groups.append({"name": name, "messages": new_msgs})
+        self._refresh_queue_list()
+        new_i = str(len(self.store.groups) - 1)
+        self.queue_tree.selection_set(new_i)
+        self.queue_tree.focus(new_i)
+        self.queue_tree.see(new_i)
+        self._refresh_messages()
+
     def _rename_queue(self):
         qi = self._selected_queue_index()
         if qi is None:
@@ -435,6 +470,8 @@ class MessageQueueWindow:
             self.store.groups[qi]["name"] = name
             self._refresh_queue_list()
             self.queue_tree.selection_set(str(qi))
+            self.queue_tree.focus(str(qi))
+            self._refresh_messages()
 
     def _delete_queue(self):
         qi = self._selected_queue_index()
@@ -449,9 +486,11 @@ class MessageQueueWindow:
             return
         del self.store.groups[qi]
         self._refresh_queue_list()
-        self._refresh_messages()
         if self.store.groups:
-            self.queue_tree.selection_set(str(min(qi, len(self.store.groups) - 1)))
+            nqi = min(qi, len(self.store.groups) - 1)
+            self.queue_tree.selection_set(str(nqi))
+            self.queue_tree.focus(str(nqi))
+        self._refresh_messages()
 
     def _move_message(self, delta):
         qi = self._selected_queue_index()
@@ -476,6 +515,9 @@ class MessageQueueWindow:
             return
         del self.store.groups[qi]["messages"][mi]
         self._refresh_queue_list()
+        if 0 <= qi < len(self.store.groups):
+            self.queue_tree.selection_set(str(qi))
+            self.queue_tree.focus(str(qi))
         self._refresh_messages()
         if self.store.groups[qi]["messages"]:
             self.msg_tree.selection_set(str(min(mi, len(self.store.groups[qi]["messages"]) - 1)))
@@ -518,8 +560,8 @@ def description_from_tree_values(values, is_summary):
         return ""
     if is_summary and len(values) > 10:
         return str(values[10])
-    if not is_summary and len(values) > 8:
-        return str(values[8])
+    if not is_summary and len(values) > 9:
+        return str(values[9])
     return ""
 
 
