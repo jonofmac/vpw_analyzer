@@ -2418,12 +2418,17 @@ class Application(tk.Frame):
         
         ''' Status Bar (message count + optional live stats in separate labels so rates do not shift the count) '''
         self.status_bar_frame = tk.Frame(self.root, bd=1, relief=tk.SUNKEN)
-        self.status_bar_frame.grid(row=4, column=0, columnspan=5, sticky="nsew")
+        # Only columns 0–1: the OBD label is gridded from column 2 onward. If we columnspan=5 here, it sits
+        # underneath the OBD widget and the throughput text is never visible.
+        self.status_bar_frame.grid(row=4, column=0, columnspan=2, sticky="nsew")
+        # Fixed-width message column so growing digit counts do not push the throughput label sideways.
+        self.status_bar_frame.columnconfigure(0, weight=0, minsize=200)
         self.status_bar_frame.columnconfigure(1, weight=1)
         self.statusBar = tk.Label(
             self.status_bar_frame,
             textvariable=self.statusBarString,
             anchor=tk.W,
+            width=26,
             padx=4,
             pady=1,
         )
@@ -2434,11 +2439,10 @@ class Application(tk.Frame):
             anchor=tk.W,
             padx=4,
             pady=1,
-            fg="#333333",
         )
-        self.statusBarRxStats.grid(row=0, column=1, sticky="nw", padx=(12, 4))
+        self.statusBarRxStats.grid(row=0, column=1, sticky="nw", padx=(8, 4))
         self.statusBarOBD = tk.Label(self.root, textvariable=self.statusBarOBDString, bd=1, relief=tk.SUNKEN, anchor=tk.W)
-        self.statusBarOBD.grid(row=4, column=2, columnspan=5, sticky='nsew')
+        self.statusBarOBD.grid(row=4, column=2, columnspan=3, sticky="nsew")
         
         
         ''' Reset any variables '''
