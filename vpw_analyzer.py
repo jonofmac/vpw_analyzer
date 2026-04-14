@@ -673,6 +673,11 @@ class OBD():
         self._dvi_transact_setup_retry(0x24, [0x03, 0x00])
         # §3.11: "31 02 01 XX" = len 0x02, payload 0x01 (sub) + XX (VPW = 0x01)
         self._dvi_transact_setup_retry(0x31, [0x01, 0x01])
+        # §3.11.8: include VPW bus CRC in frames to the host (default OFF). Without it, the last bus
+        # byte can equal the DVI serial checksum and the tool may drop or mis-frame that byte; with
+        # CRC present, length is unambiguous. Firmware may then use §3.4 large receive (0x09) instead
+        # of §3.3 normal (0x08); both are parsed in _dvi_try_pop_frame.
+        self._dvi_transact_setup_retry(0x33, [0x08, 0x01])
         # "31 02 02 XX" = len 0x02, payload 0x02 (sub) + XX (network on = 0x01)
         self._dvi_transact_setup_retry(0x31, [0x02, 0x01])
         self._vpw_capture_t0 = time.perf_counter()
@@ -722,7 +727,7 @@ class OBD():
         if self.serial:
             self._vpw_capture_t0 = time.perf_counter()
 
-    def open(self):
+    def open(self, force_elm_protocol=False):
     
         if (self.serial):
             print ("Opening serial port:", self.filename)
@@ -809,7 +814,11 @@ class OBD():
             print("Detected device was a",self.dev_type,"with a version string of:",self.dev_string)
 
             if self.dev_type == "OBDX":
-                self._open_obdx_dvi_vp_monitor()
+                if force_elm_protocol:
+                    print("OBDX: forcing ELM/AT passive monitor (skipping DVI).")
+                    self._open_elm_vp_monitor()
+                else:
+                    self._open_obdx_dvi_vp_monitor()
             else:
                 self._open_elm_vp_monitor()
             self.sp.timeout = OBD_SERIAL_RUNTIME_TIMEOUT
@@ -1890,11 +1899,12 @@ class ToolManager:
         self.is_connected = False
         self.device_string = None
         
-    def connect(self, file_path):
+    def connect(self, file_path, force_elm_protocol=False):
         """
         Connect to OBD device or open file
         Args:
             file_path: Path to serial port or file
+            force_elm_protocol: If True and the adapter is OBDX, use ELM AT commands instead of DVI.
         Returns:
             True if successful, False otherwise
         """
@@ -1902,7 +1912,9 @@ class ToolManager:
             self.disconnect()
         
         try:
-            self.reading_thread = ThreadedTask(self, self.message_queue, file_path)
+            self.reading_thread = ThreadedTask(
+                self, self.message_queue, file_path, force_elm_protocol=force_elm_protocol
+            )
             self.reading_thread.start()
             return True
         except Exception as e:
@@ -1993,10 +2005,11 @@ class ToolManager:
 This class is used to run the serial/OBD class in a separate thread
 '''
 class ThreadedTask(threading.Thread):
-    def __init__(self, tool_manager, queue, file_path):
+    def __init__(self, tool_manager, queue, file_path, force_elm_protocol=False):
         threading.Thread.__init__(self)
         self.tool_manager = tool_manager
         self.file_path = file_path
+        self.force_elm_protocol = force_elm_protocol
         self.stop_var = False
         self.obd = None
         self.queue = queue
@@ -2015,7 +2028,7 @@ class ThreadedTask(threading.Thread):
 
         self.obd = OBD(self.file_path)
         try:
-            self.obd.open()
+            self.obd.open(force_elm_protocol=self.force_elm_protocol)
         except Exception as e:
             print(f"Failed to open / configure device: {e}")
             try:
@@ -2156,6 +2169,7 @@ class Application(tk.Frame):
         self.hideHeartbeatsEverywhere = tk.BooleanVar(master=self.root, value=True)
         self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=True)
         self.decodeAsciiPayloadView = tk.BooleanVar(master=self.root, value=False)
+        self.forceElmProtocol = tk.BooleanVar(master=self.root, value=False)
         self.messageUniqueByte = tk.StringVar()
         self.messageUniqueByte.set("2")
         
@@ -2301,30 +2315,38 @@ class Application(tk.Frame):
         self.idnumber_entry.bind('<Control-a>', self.select_all_text)
         self.idnumber_entry.bind('<Control-A>', self.select_all_text)
  
- 
+        self.view_force_elm = tk.Checkbutton(
+            self.config_frame,
+            text="Force ELM protocol instead of DVI (OBDX adapters)",
+            variable=self.forceElmProtocol,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.view_force_elm.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+
         self.close_port_button = tk.Button(self.config_frame, text="Close port", command=self.close_serial_connection)
-        self.close_port_button.grid(row=4, column=0, sticky=tk.W)
+        self.close_port_button.grid(row=5, column=0, sticky=tk.W)
         self.submit_button = tk.Button(self.config_frame, text="Parse", command=self.insert_data)
-        self.submit_button.grid(row=4, column=1, sticky=tk.W)
+        self.submit_button.grid(row=5, column=1, sticky=tk.W)
         self.read_button = tk.Button(self.config_frame, text="Read/Open", command=self.read_file)
-        self.read_button.grid(row=4, column=2, sticky=tk.W)
+        self.read_button.grid(row=5, column=2, sticky=tk.W)
  
  
         # View settings (own rows so they do not overlap Parse / Read/Open)
         self.view_settings_label = tk.Label(self.config_frame, text="View Settings")
-        self.view_settings_label.grid(row=5, column=0, columnspan=3, sticky=tk.W)
+        self.view_settings_label.grid(row=6, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
-        config_sep.grid(row=6, columnspan=3, sticky='ew')
+        config_sep.grid(row=7, columnspan=3, sticky='ew')
         
         self.view_hideHeartbeats = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from summary table", variable=self.hideHeartbeats, onvalue=True, offvalue=False)
-        self.view_hideHeartbeats.grid(row=7, column=0, columnspan=3, sticky=tk.W)
+        self.view_hideHeartbeats.grid(row=8, column=0, columnspan=3, sticky=tk.W)
         self.view_hideHeartbeatsEverywhere = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from everything", variable=self.hideHeartbeatsEverywhere, onvalue=True, offvalue=False)
-        self.view_hideHeartbeatsEverywhere.grid(row=8, column=0, columnspan=3, sticky=tk.W)
+        self.view_hideHeartbeatsEverywhere.grid(row=9, column=0, columnspan=3, sticky=tk.W)
         
         self.view_uniqueByte_label = tk.Label(self.config_frame, text="Compare First # Bytes")
-        self.view_uniqueByte_label.grid(row=9, column=0, sticky=tk.W)
+        self.view_uniqueByte_label.grid(row=10, column=0, sticky=tk.W)
         self.view_uniqueByte = tk.OptionMenu(self.config_frame, self.messageUniqueByte, "0", "1", "2", "All")
-        self.view_uniqueByte.grid(row=9, column=1, sticky=tk.W)
+        self.view_uniqueByte.grid(row=10, column=1, sticky=tk.W)
 
         self.view_decode_ascii_payload = tk.Checkbutton(
             self.config_frame,
@@ -2333,7 +2355,7 @@ class Application(tk.Frame):
             onvalue=True,
             offvalue=False,
         )
-        self.view_decode_ascii_payload.grid(row=10, column=0, columnspan=3, sticky=tk.W)
+        self.view_decode_ascii_payload.grid(row=11, column=0, columnspan=3, sticky=tk.W)
         self.decodeAsciiPayloadView.trace_add("write", lambda *_: self._refresh_payload_column_display())
 
         self.delete_button = tk.Button(self.config_frame, text="Clear Message Logs", command=self.delete_data)
@@ -2748,7 +2770,7 @@ class Application(tk.Frame):
     def read_file(self):
         file_path = self.serial_port_entry.get()
         # Use ToolManager to handle connection
-        self.tool_manager.connect(file_path)
+        self.tool_manager.connect(file_path, force_elm_protocol=self.forceElmProtocol.get())
 
     def close_serial_connection(self):
         """Stop the reading thread and close the serial port (or file handle) cleanly."""
