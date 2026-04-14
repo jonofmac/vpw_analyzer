@@ -114,28 +114,45 @@ _ASCII_PAYLOAD_VIEW_BYTES = frozenset(
 )
 
 
-def _vpw_payload_body_bytes(payload_bytes):
-    """Payload bytes shown in the Payload column (strip trailing CRC when multi-byte)."""
-    if not payload_bytes:
+def _vpw_payload_body_bytes_legacy_tail(payload_tail_bytes):
+    """Legacy: ``message[3:]`` only — strip last byte when length > 1 (used if full frame was not stored)."""
+    if not payload_tail_bytes:
         return b""
-    pb = bytes(payload_bytes)
+    pb = bytes(payload_tail_bytes)
     if len(pb) == 1:
         return pb
     return pb[:-1]
 
 
-def _vpw_payload_hex_for_display(payload_bytes):
-    """Format payload for Treeview; strip trailing CRC when present (ELM). DVI often has no CRC."""
-    body = _vpw_payload_body_bytes(payload_bytes)
+def _vpw_payload_body_bytes_for_display(full_vpw_frame: bytes):
+    """
+    Bytes after the 3-byte VPW header for the Payload column / transmit copy.
+    Omit the trailing bus CRC byte only when it matches SAE J1850 CRC-8 for the full frame.
+    This avoids dropping the last real data byte on truncated DVI captures where the CRC was not present.
+    """
+    if not full_vpw_frame or len(full_vpw_frame) <= 3:
+        return b""
+    full = bytes(full_vpw_frame)
+    pb = full[3:]
+    if len(pb) <= 1:
+        return pb
+    if len(full) >= 4 and _vpw_crc8_sae_j1850(full[:-1]) == full[-1]:
+        return pb[:-1]
+    return pb
+
+
+def _vpw_payload_hex_for_display(full_vpw_frame: bytes):
+    """Format payload for Treeview; strip trailing bus CRC only when it validates."""
+    body = _vpw_payload_body_bytes_for_display(full_vpw_frame)
     if not body:
         return ""
     return " ".join("{:02X}".format(x) for x in body)
 
 
-def _vpw_payload_hex_with_ascii_bracket(payload_bytes):
+def _vpw_payload_hex_with_ascii_bracket(full_vpw_frame: bytes):
     """Space-separated hex plus a bracketed ASCII run (~ for non-printable-set bytes)."""
-    hx = _vpw_payload_hex_for_display(payload_bytes)
-    body = _vpw_payload_body_bytes(payload_bytes)
+    hx = _vpw_payload_hex_for_display(full_vpw_frame)
+    body = _vpw_payload_body_bytes_for_display(full_vpw_frame)
     if not body:
         return hx
     chars = []
@@ -145,15 +162,50 @@ def _vpw_payload_hex_with_ascii_bracket(payload_bytes):
     return f"{hx} {bracket}" if hx else bracket
 
 
-def _vpw_payload_column_text(payload_bytes, try_ascii):
+def _vpw_payload_column_text(full_vpw_frame: bytes, try_ascii):
     if try_ascii:
-        return _vpw_payload_hex_with_ascii_bracket(payload_bytes)
-    return _vpw_payload_hex_for_display(payload_bytes)
+        return _vpw_payload_hex_with_ascii_bracket(full_vpw_frame)
+    return _vpw_payload_hex_for_display(full_vpw_frame)
 
 
-def _vpw_payload_hex_for_transmit(payload_bytes):
+def _vpw_payload_hex_for_transmit(full_vpw_frame: bytes):
     """Space-separated hex for transmit / queue (same body as Payload column, never ASCII)."""
-    return _vpw_payload_hex_for_display(payload_bytes)
+    return _vpw_payload_hex_for_display(full_vpw_frame)
+
+
+def _vpw_payload_body_from_mm_row(row, payload_tail_index=7, full_frame_index=12):
+    """
+    Payload body for UI / transmit, matching a message history or summary row.
+    When ``row[full_frame_index]`` holds the full VPW frame, strip the bus CRC only if it validates.
+    Otherwise use legacy ``row[payload_tail_index]`` (``message[3:]``) rules.
+    """
+    if len(row) > full_frame_index and row[full_frame_index] is not None:
+        return _vpw_payload_body_bytes_for_display(bytes(row[full_frame_index]))
+    tail = row[payload_tail_index] if len(row) > payload_tail_index else None
+    if isinstance(tail, (bytes, bytearray)) and tail:
+        return _vpw_payload_body_bytes_legacy_tail(bytes(tail))
+    return b""
+
+
+def _vpw_payload_hex_for_mm_row(row, payload_tail_index=7, full_frame_index=12):
+    body = _vpw_payload_body_from_mm_row(row, payload_tail_index, full_frame_index)
+    if not body:
+        return ""
+    return " ".join("{:02X}".format(x) for x in body)
+
+
+def _vpw_payload_column_text_for_mm_row(row, try_ascii, payload_tail_index=7, full_frame_index=12):
+    body = _vpw_payload_body_from_mm_row(row, payload_tail_index, full_frame_index)
+    if not body:
+        return ""
+    if try_ascii:
+        chars = []
+        for b in body:
+            chars.append(chr(b) if b in _ASCII_PAYLOAD_VIEW_BYTES else "~")
+        bracket = "[" + "".join(chars) + "]"
+        hx = " ".join("{:02X}".format(x) for x in body)
+        return f"{hx} {bracket}"
+    return " ".join("{:02X}".format(x) for x in body)
 
 
 # Datalog lines may start with relative receive time in seconds (exactly three fractional digits).
@@ -722,7 +774,7 @@ class OBD():
         if self.serial:
             self._vpw_capture_t0 = time.perf_counter()
 
-    def open(self):
+    def open(self, force_elm_protocol=False):
     
         if (self.serial):
             print ("Opening serial port:", self.filename)
@@ -809,7 +861,11 @@ class OBD():
             print("Detected device was a",self.dev_type,"with a version string of:",self.dev_string)
 
             if self.dev_type == "OBDX":
-                self._open_obdx_dvi_vp_monitor()
+                if force_elm_protocol:
+                    print("OBDX: forcing ELM/AT passive monitor (skipping DVI).")
+                    self._open_elm_vp_monitor()
+                else:
+                    self._open_obdx_dvi_vp_monitor()
             else:
                 self._open_elm_vp_monitor()
             self.sp.timeout = OBD_SERIAL_RUNTIME_TIMEOUT
@@ -1770,6 +1826,7 @@ class MessageManager():
                 data_value,
                 description,
                 recv_rel_sec,
+                bytes(newMsg["message"]),
             ]
         )
 
@@ -1793,7 +1850,23 @@ class MessageManager():
             return
         
         if (summaryInd == -1):
-            self.messageSummary.append([len(self.messageSummary), 1, tempMsg[0], newMsg["message"][0], taModule, saModule, newMsg["priority"], newMsg["mode"], newMsg["mode type"], newMsg["message"][3:], data_value, description])
+            self.messageSummary.append(
+                [
+                    len(self.messageSummary),
+                    1,
+                    tempMsg[0],
+                    newMsg["message"][0],
+                    taModule,
+                    saModule,
+                    newMsg["priority"],
+                    newMsg["mode"],
+                    newMsg["mode type"],
+                    newMsg["message"][3:],
+                    data_value,
+                    description,
+                    bytes(newMsg["message"]),
+                ]
+            )
             
             self.UIHook.new_message_summary(self.messageSummary[-1])
         else:
@@ -1803,6 +1876,11 @@ class MessageManager():
             self.messageSummary[summaryInd][9] = tempMsg[7]
             self.messageSummary[summaryInd][10] = data_value  # Update data value
             self.messageSummary[summaryInd][11] = description  # Update description too
+            srow = self.messageSummary[summaryInd]
+            if len(srow) <= 12:
+                srow.append(tempMsg[12])
+            else:
+                srow[12] = tempMsg[12]
             
             self.UIHook.update_message_summary(summaryInd, self.messageSummary[summaryInd])
         
@@ -1890,11 +1968,12 @@ class ToolManager:
         self.is_connected = False
         self.device_string = None
         
-    def connect(self, file_path):
+    def connect(self, file_path, force_elm_protocol=False):
         """
         Connect to OBD device or open file
         Args:
             file_path: Path to serial port or file
+            force_elm_protocol: If True and the adapter is OBDX, use ELM AT commands instead of DVI.
         Returns:
             True if successful, False otherwise
         """
@@ -1902,7 +1981,9 @@ class ToolManager:
             self.disconnect()
         
         try:
-            self.reading_thread = ThreadedTask(self, self.message_queue, file_path)
+            self.reading_thread = ThreadedTask(
+                self, self.message_queue, file_path, force_elm_protocol=force_elm_protocol
+            )
             self.reading_thread.start()
             return True
         except Exception as e:
@@ -1993,10 +2074,11 @@ class ToolManager:
 This class is used to run the serial/OBD class in a separate thread
 '''
 class ThreadedTask(threading.Thread):
-    def __init__(self, tool_manager, queue, file_path):
+    def __init__(self, tool_manager, queue, file_path, force_elm_protocol=False):
         threading.Thread.__init__(self)
         self.tool_manager = tool_manager
         self.file_path = file_path
+        self.force_elm_protocol = force_elm_protocol
         self.stop_var = False
         self.obd = None
         self.queue = queue
@@ -2015,7 +2097,7 @@ class ThreadedTask(threading.Thread):
 
         self.obd = OBD(self.file_path)
         try:
-            self.obd.open()
+            self.obd.open(force_elm_protocol=self.force_elm_protocol)
         except Exception as e:
             print(f"Failed to open / configure device: {e}")
             try:
@@ -2156,6 +2238,7 @@ class Application(tk.Frame):
         self.hideHeartbeatsEverywhere = tk.BooleanVar(master=self.root, value=True)
         self.showTransmittedFrames = tk.BooleanVar(master=self.root, value=True)
         self.decodeAsciiPayloadView = tk.BooleanVar(master=self.root, value=False)
+        self.forceElmProtocol = tk.BooleanVar(master=self.root, value=False)
         self.messageUniqueByte = tk.StringVar()
         self.messageUniqueByte.set("2")
         
@@ -2301,30 +2384,38 @@ class Application(tk.Frame):
         self.idnumber_entry.bind('<Control-a>', self.select_all_text)
         self.idnumber_entry.bind('<Control-A>', self.select_all_text)
  
- 
+        self.view_force_elm = tk.Checkbutton(
+            self.config_frame,
+            text="Force ELM protocol instead of DVI (OBDX adapters)",
+            variable=self.forceElmProtocol,
+            onvalue=True,
+            offvalue=False,
+        )
+        self.view_force_elm.grid(row=4, column=0, columnspan=3, sticky=tk.W)
+
         self.close_port_button = tk.Button(self.config_frame, text="Close port", command=self.close_serial_connection)
-        self.close_port_button.grid(row=4, column=0, sticky=tk.W)
+        self.close_port_button.grid(row=5, column=0, sticky=tk.W)
         self.submit_button = tk.Button(self.config_frame, text="Parse", command=self.insert_data)
-        self.submit_button.grid(row=4, column=1, sticky=tk.W)
+        self.submit_button.grid(row=5, column=1, sticky=tk.W)
         self.read_button = tk.Button(self.config_frame, text="Read/Open", command=self.read_file)
-        self.read_button.grid(row=4, column=2, sticky=tk.W)
+        self.read_button.grid(row=5, column=2, sticky=tk.W)
  
  
         # View settings (own rows so they do not overlap Parse / Read/Open)
         self.view_settings_label = tk.Label(self.config_frame, text="View Settings")
-        self.view_settings_label.grid(row=5, column=0, columnspan=3, sticky=tk.W)
+        self.view_settings_label.grid(row=6, column=0, columnspan=3, sticky=tk.W)
         config_sep = ttk.Separator(self.config_frame, orient='horizontal')
-        config_sep.grid(row=6, columnspan=3, sticky='ew')
+        config_sep.grid(row=7, columnspan=3, sticky='ew')
         
         self.view_hideHeartbeats = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from summary table", variable=self.hideHeartbeats, onvalue=True, offvalue=False)
-        self.view_hideHeartbeats.grid(row=7, column=0, columnspan=3, sticky=tk.W)
+        self.view_hideHeartbeats.grid(row=8, column=0, columnspan=3, sticky=tk.W)
         self.view_hideHeartbeatsEverywhere = tk.Checkbutton(self.config_frame, text="Hide module heartbeats from everything", variable=self.hideHeartbeatsEverywhere, onvalue=True, offvalue=False)
-        self.view_hideHeartbeatsEverywhere.grid(row=8, column=0, columnspan=3, sticky=tk.W)
+        self.view_hideHeartbeatsEverywhere.grid(row=9, column=0, columnspan=3, sticky=tk.W)
         
         self.view_uniqueByte_label = tk.Label(self.config_frame, text="Compare First # Bytes")
-        self.view_uniqueByte_label.grid(row=9, column=0, sticky=tk.W)
+        self.view_uniqueByte_label.grid(row=10, column=0, sticky=tk.W)
         self.view_uniqueByte = tk.OptionMenu(self.config_frame, self.messageUniqueByte, "0", "1", "2", "All")
-        self.view_uniqueByte.grid(row=9, column=1, sticky=tk.W)
+        self.view_uniqueByte.grid(row=10, column=1, sticky=tk.W)
 
         self.view_decode_ascii_payload = tk.Checkbutton(
             self.config_frame,
@@ -2333,7 +2424,7 @@ class Application(tk.Frame):
             onvalue=True,
             offvalue=False,
         )
-        self.view_decode_ascii_payload.grid(row=10, column=0, columnspan=3, sticky=tk.W)
+        self.view_decode_ascii_payload.grid(row=11, column=0, columnspan=3, sticky=tk.W)
         self.decodeAsciiPayloadView.trace_add("write", lambda *_: self._refresh_payload_column_display())
 
         self.delete_button = tk.Button(self.config_frame, text="Clear Message Logs", command=self.delete_data)
@@ -2672,7 +2763,7 @@ class Application(tk.Frame):
 
     def _message_history_tree_values_tuple(self, hist_row):
         try_ascii = self.decodeAsciiPayloadView.get()
-        pl = _vpw_payload_column_text(hist_row[7], try_ascii)
+        pl = _vpw_payload_column_text_for_mm_row(hist_row, try_ascii, 7, 12)
         ts = hist_row[11] if len(hist_row) > 11 else None
         ts_txt = _format_vpw_export_timestamp(ts) if ts is not None else ""
         return (
@@ -2690,7 +2781,7 @@ class Application(tk.Frame):
 
     def _summary_tree_values_tuple(self, sum_row):
         try_ascii = self.decodeAsciiPayloadView.get()
-        pl = _vpw_payload_column_text(sum_row[9], try_ascii)
+        pl = _vpw_payload_column_text_for_mm_row(sum_row, try_ascii, 9, 12)
         return (
             sum_row[2],
             sum_row[1],
@@ -2748,7 +2839,7 @@ class Application(tk.Frame):
     def read_file(self):
         file_path = self.serial_port_entry.get()
         # Use ToolManager to handle connection
-        self.tool_manager.connect(file_path)
+        self.tool_manager.connect(file_path, force_elm_protocol=self.forceElmProtocol.get())
 
     def close_serial_connection(self):
         """Stop the reading thread and close the serial port (or file handle) cleanly."""
@@ -2922,12 +3013,12 @@ class Application(tk.Frame):
             if is_summary:
                 if idx < 0 or idx >= len(self.mm.messageSummary) or len(vals) < 10:
                     return None
-                raw_pl = self.mm.messageSummary[idx][9]
+                mm_row = self.mm.messageSummary[idx]
                 hdr, ta, sa = vals[2], vals[6], vals[7]
             else:
                 if idx < 0 or idx >= len(self.mm.messageHistory) or len(vals) < 7:
                     return None
-                raw_pl = self.mm.messageHistory[idx][7]
+                mm_row = self.mm.messageHistory[idx]
                 hdr, ta, sa = vals[1], vals[5], vals[6]
         except (IndexError, TypeError):
             return None
@@ -2938,7 +3029,7 @@ class Application(tk.Frame):
                 header = f"{hdr} {ta_hex} {sa_hex}"
             else:
                 header = str(hdr)
-            pl = _vpw_payload_hex_for_transmit(raw_pl)
+            pl = _vpw_payload_hex_for_mm_row(mm_row, 9 if is_summary else 7, 12)
             return (header.strip(), pl.strip())
         except (TypeError, ValueError):
             return None
